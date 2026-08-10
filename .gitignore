@@ -1,0 +1,60 @@
+# CMake build trees (the patterns also match nested practice directories)
+build/
+build-*/
+out/
+cmake-build-*/
+.cache/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+_deps/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Makefile
+CMakeUserPresets.json
+CMakeLists.txt.user
+
+# IDE and user-local state
+.vs/
+/.vscode/*
+!/.vscode/extensions.json
+!/.vscode/settings.json
+.idea/
+.qtcreator/
+*.sln
+*.suo
+*.user
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+
+# Compiler and linker outputs
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+
+# Logs, temporary files, and OS metadata
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db

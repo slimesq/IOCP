@@ -1,0 +1,50 @@
+# Shared C++ formatting rules, adapted from remote_control.
+BasedOnStyle: Google
+TabWidth: 4
+IndentWidth: 4
+UseTab: Never
+ColumnLimit: 100
+ReflowComments: false
+
+---
+Language: Cpp
+DisableFormat: false
+Standard: c++17
+Cpp11BracedListStyle: true
+SortIncludes: false
+
+AccessModifierOffset: -4
+AlignOperands: DontAlign
+CompactNamespaces: true
+
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+
+BinPackArguments: false
+BinPackParameters: false
+
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterClass: true
+  AfterControlStatement: true
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  BeforeCatch: true
+  BeforeElse: true
+  AfterExternBlock: true
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+
+QualifierAlignment: Right
+DerivePointerAlignment: false
+PointerAlignment: Left
