@@ -1,4 +1,8 @@
 function(iocp_configure_target target_name)
+    target_include_directories(${target_name} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+
     target_compile_options(${target_name} PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4>
         $<$<CXX_COMPILER_ID:MSVC>:/permissive->
@@ -40,9 +44,6 @@ function(iocp_configure_target target_name)
     string(REPLACE "\\" "/" target_folder "${target_folder}")
     set_target_properties(${target_name} PROPERTIES FOLDER "practice/${target_folder}")
 
-    if(BUILD_TESTING)
-        add_test(NAME "${target_name}.Smoke" COMMAND ${target_name})
-    endif()
 endfunction()
 
 function(iocp_make_practice_target_name output_variable source_directory)

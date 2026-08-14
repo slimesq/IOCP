@@ -1,6 +1,7 @@
 {
   "C_Cpp.intelliSenseEngine": "disabled",
   "cmake.useCMakePresets": "always",
+  "cmake.outputLogEncoding": "auto",
   "cmake.useVsDeveloperEnvironment": "always",
   "cmake.configureOnOpen": true,
   "cmake.configureOnEdit": true,

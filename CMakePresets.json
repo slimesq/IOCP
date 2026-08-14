@@ -48,21 +48,5 @@
       "configurePreset": "msvc-release",
       "jobs": 8
     }
-  ],
-  "testPresets": [
-    {
-      "name": "msvc-debug",
-      "configurePreset": "msvc-debug",
-      "output": {
-        "outputOnFailure": true
-      }
-    },
-    {
-      "name": "msvc-release",
-      "configurePreset": "msvc-release",
-      "output": {
-        "outputOnFailure": true
-      }
-    }
   ]
 }

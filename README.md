@@ -9,7 +9,7 @@
 - Debug/Release CMake presets。
 - 编译警告、UTF-8 和 Windows Unicode 宏。
 - Winsock 库 ws2_32 与 mswsock。
-- 输出目录、CTest 和 compile_commands.json。
+- 输出目录和 compile_commands.json。
 - practice 下面的练习项目自动发现。
 
 日常配置、编译、运行和调试全部通过 CMake Tools 选择，不需要 PowerShell 构建脚本。
@@ -48,7 +48,6 @@ Visual Studio Developer Environment，因此可以找到 cl.exe、link.exe 和 n
 - 编译：执行 **CMake: 生成**，或者点击状态栏 Build 按钮。
 - 运行：执行 **CMake: 运行但不调试**。
 - 调试：执行 **CMake: 调试**。
-- 测试：执行 **CMake: 运行测试**，也可以在 VS Code 测试面板中选择测试。
 
 当前 target：
 
