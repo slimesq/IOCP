@@ -1,0 +1,1 @@
+iocp_add_current_practice_executable()
