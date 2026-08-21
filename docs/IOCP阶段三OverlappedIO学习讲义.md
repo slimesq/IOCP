@@ -1,125 +1,229 @@
 # IOCP 阶段三：Overlapped I/O 学习讲义
 
-> 贯穿项目：`D:\CodeRepository\claude\remote_control`  
-> 适用环境：Windows、MSVC、C++17  
-> 本讲义只讲阶段三需要掌握的 Overlapped I/O。代码均为关键示例片段，不要求在当前项目中创建或运行额外示例工程。
+> 前置知识：阶段二的同步 Winsock、RAII、指针与基本错误处理。
+> 贯穿项目：`D:\CodeRepository\claude\remote_control`。
+> 学习范围：事件通知版 Overlapped receive/send；IOCP、并发 worker、异步 accept 和安全停机将在后续阶段学习。
 
-## 1. 阶段目标
+## 1. Overlapped I/O 学习主线
 
-完成本阶段后，应能够独立回答：
+Overlapped I/O 最难的部分不是 API 数量，而是“函数已经返回，操作却还没有结束”。先在单线程事件模型中掌握 operation 生命周期，可以把这一问题与多线程、completion port、连接状态机和停机流程分开理解。
 
-1. Overlapped I/O 与同步 I/O 的控制流有什么不同？
-2. `OVERLAPPED`、`WSABUF` 和真实 buffer 分别由谁拥有？
-3. `WSARecv()` 返回 `0`、`WSA_IO_PENDING` 和其他错误分别表示什么？
-4. 为什么异步 API 返回后通常不能释放操作对象？
-5. 为什么一个在途操作必须独占一个 `OVERLAPPED`？
-6. 如何使用事件对象取得一次 receive 的最终结果？
-7. `CancelIoEx()` 返回后为什么仍要等待最终完成？
-8. 项目的 `IoOperation` 如何保证 operation、buffer 和 connection 存活？
-9. pending 计数为什么必须在调用异步 API 前增加？
+常用术语：
 
-建议投入 6～10 小时。阶段四学习 IOCP 前，必须先理解本讲义中的生命周期。
+| 术语 | 含义 |
+| --- | --- |
+| operation | 一次独立的 I/O 请求，例如一次 `WSARecv()` 或一次 `WSASend()`。 |
+| 在途 operation | 已经提交成功，但还没有取得最终完成结果的 I/O 请求。 |
+| completion | operation 最终结束时产生的结果，包括成功或失败、传输字节数和相关 flags。 |
+| buffer | 用于保存接收数据或发送数据的一段连续内存。 |
+| pending | operation 已提交成功，但尚未最终完成；它不是失败。 |
+| event | Windows 同步对象。本阶段用它通知某次 operation 已经结束。 |
+| nonsignaled / signaled | event 的两种状态；前者表示尚未收到通知，后者表示等待条件已经满足。 |
+| `transferredBytes` | 当前这一次 operation 最终实际传输的字节数，不是 buffer 容量，也不是累计值。 |
+| 视图 | 只记录另一块内存的地址和长度，不拥有、复制或释放那块内存。例如 `WSABUF`。 |
 
-## 2. 本阶段的边界
+学习主线：
 
-### 2.1 现在学习
+```text
+回顾同步 recv
+  → 认识 OVERLAPPED、WSABUF、buffer
+  → 创建支持 Overlapped I/O 的 socket
+  → 准备一个事件和一次 receive
+  → 区分立即完成、pending、同步失败
+  → 等待事件并取得最终结果
+  → 把相关对象封装为 ReceiveOperation
+  → 顺序执行多次 receive
+  → 学习 WSASend 与部分发送
+  → 理解项目 IoOperation 的成员所有权
+```
+
+这条主线先解决 operation 与 buffer 的生命周期，再为 completion port 模型建立基础。
+
+建议分五个学习单元推进。完成当前单元的自检后，再进入下一个单元：
+
+1. **建立心智模型（第 4～6 节）**
+   - 解决的问题：为什么 API 返回后，operation 可能仍未结束。
+   - 学完自检：能画出 `OVERLAPPED`、`WSABUF` 与真实 buffer 的关系。
+2. **完成一次 receive（第 7～11 节）**
+   - 解决的问题：如何提交、等待并取得一次 receive 的最终结果。
+   - 学完自检：能独立判断立即完成、pending 和同步投递失败。
+3. **管理 receive 生命周期（第 12～16 节）**
+   - 解决的问题：如何安全保存对象、处理数据并继续下一次 receive。
+   - 学完自检：能解释局部变量何时安全、何时会悬空。
+4. **迁移到 send（第 17～19 节）**
+   - 解决的问题：receive 流程如何复用于 send，以及怎样计算剩余发送范围。
+   - 学完自检：能根据每次 `transferredBytes` 正确更新 `offset`。
+5. **映射到项目（第 20～22 节）**
+   - 解决的问题：项目中的 `IoOperation`、buffer 和 connection 分别由谁保持存活。
+   - 学完自检：能完成所有权图和最终综合验收。
+
+---
+
+## 2. 知识范围
+
+### 2.1 核心内容
 
 - `WSA_FLAG_OVERLAPPED`。
 - `OVERLAPPED`。
 - `WSABUF`。
+- `WSACreateEvent()`、`WSACloseEvent()`。
 - `WSARecv()`、`WSASend()`。
-- 立即完成、pending、同步投递失败。
-- 事件通知与 `WSAGetOverlappedResult()`。
-- 取消后的最终完成。
+- `WSA_IO_PENDING`。
+- `WSAWaitForMultipleEvents()`。
+- `WSAGetOverlappedResult()`。
 - operation 与 buffer 生命周期。
+- 非零长度 TCP receive 的零字节完成。
+- send 部分完成。
 
-### 2.2 暂时不学习
+### 2.2 后续内容
 
-- `CreateIoCompletionPort()`。
-- `GetQueuedCompletionStatus()`。
-- completion worker 调度。
-- `PostQueuedCompletionStatus()`。
-- `AcceptEx()`。
+以下主题不属于事件通知版 Overlapped I/O 的前置知识：
 
-本阶段使用事件对象理解完成过程。事件不是高并发服务端的最终方案，但它能把一次 Overlapped I/O 的生命周期完整展示出来。
+| 符号或主题 | 后续阶段 |
+| --- | --- |
+| `CreateIoCompletionPort()`、`GetQueuedCompletionStatus()` | 阶段四 |
+| completion worker、completion key | 阶段四 |
+| `AcceptEx()` | 阶段五 |
+| 连接状态机、有序发送队列、背压 | 阶段七 |
+| pending I/O 计数、`CancelIoEx()`、并发关闭、安全停机 | 阶段九 |
+
+项目代码中的这些符号涉及后续模型；当前只分析与 operation 所有权直接相关的类型和函数。
 
 ---
 
-## 3. 从同步 I/O 切换到 Overlapped I/O
+## 3. 学习完成标准
 
-### 3.1 同步 receive
+完成本阶段后，应能够：
+
+1. 解释同步 I/O 与 Overlapped I/O 的控制流差异。
+2. 解释 `OVERLAPPED`、`WSABUF` 和真实 buffer 的职责。
+3. 正确判断 `WSARecv()` 和 `WSASend()` 的三种提交结果。
+4. 使用事件等待一次 operation 的最终完成。
+5. 只处理 `[0, transferredBytes)` 范围内的数据。
+6. 识别非零长度 TCP receive 中，对端正常关闭产生的零字节完成。
+7. 解释为什么在途 operation 不能销毁或复用。
+8. 解释部分发送为什么需要继续发送剩余字节。
+9. 看懂项目 `IoOperation` 中哪些成员拥有内存、哪些只是视图。
+10. 解释项目中的 `connection` 如何保证连接上下文活到 operation 最终完成。
+
+建议投入 6～10 小时。
+
+---
+
+## 4. 从同步 receive 开始
+
+同步代码：
+
+```cpp
+std::array<char, 8192> buffer{};
+
+int const receivedBytes{recv(socketHandle,
+                             buffer.data(),
+                             static_cast<int>(buffer.size()),
+                             0)};
+```
+
+### 4.1 `recv()` 参数回顾
+
+```cpp
+int recv(
+    SOCKET s,
+    char* buf,
+    int len,
+    int flags);
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `s` | 已连接的 socket。 |
+| `buf` | 接收数据写入的内存首地址。 |
+| `len` | buffer 容量，单位为 byte。 |
+| `flags` | 接收标志；普通读取使用 `0`。 |
+
+返回值：
+
+- 大于 `0`：实际收到的字节数。
+- 等于 `0`：对端正常关闭。
+- `SOCKET_ERROR`：调用 `WSAGetLastError()` 取得错误码。
+
+### 4.2 同步模式为什么容易管理生命周期
 
 ```text
-创建 buffer
-  → 调用 recv()
-  → 当前线程阻塞
-  → recv() 返回
+buffer 创建
+  → recv 阻塞
+  → recv 返回最终结果
   → 使用 buffer
-  → 离开作用域
+  → buffer 离开作用域
 ```
 
-调用、等待和结果处理都发生在同一个栈帧中，所以 buffer 生命周期通常不容易出错。
-
-### 3.2 Overlapped receive
-
-```text
-创建 operation 和 buffer
-  → 调用 WSARecv() 提交操作
-  → WSARecv() 返回
-  → Windows 可能继续使用 operation 和 buffer
-  → 未来产生最终完成结果
-  → 应用取得结果
-  → 最后释放 operation 和 buffer
-```
-
-核心变化是：
-
-> “提交函数返回”与“操作真正结束”不再是同一个时刻。
-
-### 3.3 Windows 借用的是地址
-
-调用 `WSARecv()` 时，应用向 Windows 提供：
-
-```text
-OVERLAPPED*  ──→ 标识一次具体操作
-WSABUF*      ──→ 描述 buffer 地址和长度
-WSABUF.buf   ──→ 指向真实存储空间
-```
-
-Windows 不理解 `std::vector`、`QByteArray`、`std::unique_ptr` 或 C++ 作用域。它只会在操作期间使用这些地址。
-
-因此，在最终完成前必须保证：
-
-1. `OVERLAPPED` 仍然存在且地址不变。
-2. `WSABUF` 指向的内存仍然存在且地址不变。
-3. buffer 没有被扩容、移动或销毁。
-4. 应用仍能在完成时找到 operation 并正确释放。
+`recv()` 返回时，系统已经不会继续使用该次调用的 buffer。
 
 ---
 
-## 4. 三个核心对象
+## 5. Overlapped I/O 的控制流变化
 
-### 4.1 `OVERLAPPED`
+Overlapped receive：
 
-`OVERLAPPED` 标识一次异步操作。
+```text
+准备 OVERLAPPED、WSABUF、buffer
+  → 调用 WSARecv 提交
+  → WSARecv 返回
+  → 操作可能仍在进行
+  → 未来产生最终完成结果
+  → 应用取得最终结果
+  → 才能释放或复用对象
+```
+
+关键变化：
+
+> API 返回与 operation 最终结束不再是同一个时刻。
+
+### 5.1 Windows 借用的是地址
+
+提交时 Windows 得到：
+
+```text
+OVERLAPPED*  ─→ 标识本次 operation
+WSABUF*      ─→ 描述 buffer
+WSABUF.buf   ─→ 指向真实字节内存
+```
+
+Windows 不理解 `std::array`、`std::vector`、`QByteArray` 或对象作用域。它只使用原生地址。
+
+`WSARecv()` 和 `WSASend()` 的服务提供者会在函数返回前捕获 `WSABUF` 描述符，因此 `WSABUF` 对象本身不必像真实 buffer 一样一直存活。真正不能提前失效的是 `WSABUF.buf` 指向的字节内存。项目仍把 `WSABUF` 放进 operation，主要是为了集中表达关系并便于后续投递。
+
+最终完成前必须保证：
+
+1. `OVERLAPPED` 对象仍存在，地址不变。
+2. `WSABUF` 指向的内存仍存在，地址不变。
+3. buffer 没有被移动、扩容或销毁。
+4. socket 仍处于能够完成该 operation 的生命周期中。
+
+在 operation 最终完成前，也不要访问正在被系统使用的内存：receive buffer 正由系统写入，send buffer 正由系统读取。
+
+---
+
+## 6. 三个核心对象
+
+### 6.1 `OVERLAPPED`
 
 ```cpp
 OVERLAPPED overlapped{};
 ```
 
-必须遵守：
+规则：
 
-- 创建时零初始化。
-- 一个在途操作独占一个实例。
-- 在操作最终完成前不能销毁。
-- 在操作最终完成前不能重新清零或复用。
-- `Internal` 和 `InternalHigh` 由系统使用，不要自行修改。
-- socket receive/send 通常不使用 `Offset` 和 `OffsetHigh`。
-- 事件模式下将 `hEvent` 设置为有效事件。
+- 必须零初始化。
+- 一个在途 operation 独占一个实例。
+- 最终完成前不能销毁。
+- 最终完成前不能清零或复用。
+- `Internal`、`InternalHigh` 由系统使用。
+- socket receive/send 通常不使用文件偏移字段。
+- 事件通知模式使用 `hEvent`。
 
-### 4.2 `WSABUF`
+### 6.2 `WSABUF`
 
-可以把 `WSABUF` 理解为：
+可以简化理解为：
 
 ```cpp
 struct WSABUF
@@ -129,7 +233,7 @@ struct WSABUF
 };
 ```
 
-它只是视图，不拥有内存：
+准备 receive buffer：
 
 ```cpp
 std::array<char, 8192> storage{};
@@ -139,25 +243,31 @@ nativeBuffer.buf = storage.data();
 nativeBuffer.len = static_cast<ULONG>(storage.size());
 ```
 
-所有权关系：
+所有权：
 
 ```text
-std::array owns bytes
-WSABUF observes bytes
+storage（std::array） ──拥有──> 8192 字节的真实内存
+nativeBuffer.buf     ──指向──> storage.data()
 ```
 
-销毁 `WSABUF` 不会释放 buffer；保留 `WSABUF` 也不会让 buffer 自动存活。
+`storage` 负责创建和释放真实内存；`WSABUF` 只保存地址和长度，不会复制、移动或释放这块内存。
 
-### 4.3 真实 buffer
+需要区分两种生命周期：
 
-buffer 可以由以下对象拥有：
+```text
+WSABUF 描述符：服务提供者在 WSARecv/WSASend 返回前捕获
+WSABUF.buf 指向的真实字节：必须活到 operation 最终完成
+```
+
+### 6.3 真实 buffer
+
+可以使用：
 
 - `std::array<char, N>`。
-- `std::vector<char>`。
-- `QByteArray`。
-- operation 中的固定内存块。
+- 已经确定大小的 `std::vector<char>`。
+- 已经确定大小的 `QByteArray`。
 
-如果使用可扩容容器，在操作在途期间不能执行可能改变地址的操作：
+错误示例：
 
 ```cpp
 std::vector<char> storage;
@@ -165,58 +275,15 @@ storage.resize(8192);
 
 WSABUF nativeBuffer{};
 nativeBuffer.buf = storage.data();
+nativeBuffer.len = static_cast<ULONG>(storage.size());
 
-// WSARecv 已进入 pending 后：
-storage.resize(16384);  // 错误：可能重分配，nativeBuffer.buf 仍指向旧地址。
+// WSARecv 已经进入 pending 后：
+storage.resize(16384);  // 错误：可能改变 data() 地址。
 ```
 
 ---
 
-## 5. 操作生命周期状态机
-
-```text
-Created
-  │
-  ├─ 同步投递失败 ─────────────────────→ Finished
-  │
-  ├─ 立即完成 ─────────────────────────→ Completed → Finished
-  │
-  └─ WSA_IO_PENDING ─→ InFlight
-                         │
-                         ├─ 成功完成 ───→ Completed → Finished
-                         ├─ 对端关闭 ───→ Completed → Finished
-                         ├─ I/O 失败 ───→ Completed → Finished
-                         └─ 请求取消 ───→ Cancelling
-                                            │
-                                            └─ 取消完成 → Finished
-```
-
-`CancelIoEx()` 只把操作推进到“请求取消”，不会瞬间推进到 `Finished`。
-
-### 5.1 一个操作一个 `OVERLAPPED`
-
-错误关系：
-
-```text
-OVERLAPPED X ─→ Receive A 尚未完成
-       同时 └→ Receive B 又使用 X
-```
-
-正确关系：
-
-```text
-OVERLAPPED A ─→ Receive A
-OVERLAPPED B ─→ Receive B
-OVERLAPPED C ─→ Send C
-```
-
-项目采用更严格的不变量：每条连接最多一个 receive 和一个 send 在途。这是项目设计，不是 Winsock 的强制限制。
-
----
-
-## 6. 创建支持 Overlapped I/O 的 socket
-
-关键参数是 `WSA_FLAG_OVERLAPPED`：
+## 7. 创建支持 Overlapped I/O 的 socket
 
 ```cpp
 SOCKET socketHandle{WSASocketW(
@@ -226,17 +293,9 @@ SOCKET socketHandle{WSASocketW(
     nullptr,
     0,
     WSA_FLAG_OVERLAPPED)};
-
-if (socketHandle == INVALID_SOCKET)
-{
-    int const error{WSAGetLastError()};
-    reportWinsockError(error);
-}
 ```
 
-### 6.1 `WSASocketW()` 参数说明
-
-函数原型可以简化理解为：
+### 7.1 `WSASocketW()` 参数说明
 
 ```cpp
 SOCKET WSASocketW(
@@ -250,54 +309,117 @@ SOCKET WSASocketW(
 
 | 参数 | 示例值 | 作用 |
 | --- | --- | --- |
-| `af` | `AF_INET` | 地址族。`AF_INET` 表示 IPv4，`AF_INET6` 表示 IPv6。 |
-| `type` | `SOCK_STREAM` | socket 类型。`SOCK_STREAM` 表示有序的字节流，也就是 TCP 使用的类型。 |
-| `protocol` | `IPPROTO_TCP` | 明确指定 TCP 协议。与 `AF_INET + SOCK_STREAM` 配合使用。 |
-| `lpProtocolInfo` | `nullptr` | 可选的协议提供者信息。传空表示由 Winsock 根据前三个参数选择提供者。 |
-| `g` | `0` | socket group。普通场景不使用分组时传 `0`。 |
-| `dwFlags` | `WSA_FLAG_OVERLAPPED` | 创建标志。该标志表示 socket 支持 Overlapped I/O。 |
+| `af` | `AF_INET` | IPv4 地址族。 |
+| `type` | `SOCK_STREAM` | 有序字节流 socket。 |
+| `protocol` | `IPPROTO_TCP` | TCP 协议。 |
+| `lpProtocolInfo` | `nullptr` | 不指定自定义协议提供者。 |
+| `g` | `0` | 不使用 socket group。 |
+| `dwFlags` | `WSA_FLAG_OVERLAPPED` | 允许该 socket 使用 Overlapped I/O。 |
 
 返回值：
 
-- 成功：返回有效 `SOCKET`。
-- 失败：返回 `INVALID_SOCKET`，随后立即调用 `WSAGetLastError()` 取得当前线程的 Winsock 错误码。
+- 成功：有效 `SOCKET`。
+- 失败：`INVALID_SOCKET`，调用 `WSAGetLastError()`。
 
-### 6.2 错误与关闭函数
+### 7.2 错误与关闭函数
 
 | 函数 | 参数 | 返回值与作用 |
 | --- | --- | --- |
-| `WSAGetLastError()` | 无 | 返回当前调用线程最近一次 Winsock 错误码。应在失败后立即读取，避免被后续 Winsock 调用覆盖。 |
-| `GetLastError()` | 无 | 返回当前调用线程最近一次 Win32 错误码。`CancelIoEx()` 失败时使用它，而不是 `WSAGetLastError()`。 |
-| `closesocket(s)` | `s` 是要关闭的 `SOCKET` | 成功返回 `0`，失败返回 `SOCKET_ERROR`。关闭会终止 socket 使用，但不能代替在途 operation 的最终回收。 |
+| `WSAGetLastError()` | 无 | 返回当前线程最近一次 Winsock 错误码。失败后立即读取。 |
+| `closesocket(s)` | `s` 是要关闭的 socket | 成功返回 `0`，失败返回 `SOCKET_ERROR`。 |
 
-错误来源要区分：
-
-- Winsock API 通常使用 `WSAGetLastError()`。
-- `CancelIoEx()` 等普通 Win32 API 使用 `GetLastError()`。
-- `SOCKET` 使用 `closesocket()`，不要使用 `CloseHandle()`。
+主动关闭 socket 的前置条件是不存在在途 operation。带在途 operation 的取消与关闭属于阶段九。
 
 ---
 
-## 7. `WSARecv()` 的三种提交结果
+## 8. 准备事件对象
 
-关键调用：
+```cpp
+WSAEVENT eventHandle{WSACreateEvent()};
+if (eventHandle == WSA_INVALID_EVENT)
+{
+    int const error{WSAGetLastError()};
+    reportWinsockError(error);
+}
+
+OVERLAPPED overlapped{};
+overlapped.hEvent = eventHandle;
+```
+
+`reportWinsockError(_error)` 是示意用错误报告函数；参数 `_error` 是刚刚保存的 Winsock 错误码。它不是新的 Winsock API。
+
+### 8.1 `WSACreateEvent()`
+
+```cpp
+WSAEVENT WSACreateEvent();
+```
+
+参数：无。
+
+返回值：
+
+- 成功：返回一个初始为 nonsignaled 的 `WSAEVENT`。
+- 失败：返回 `WSA_INVALID_EVENT`，调用 `WSAGetLastError()`。
+
+### 8.2 `WSACloseEvent()`
+
+```cpp
+BOOL WSACloseEvent(WSAEVENT hEvent);
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `hEvent` | 要关闭的 `WSAEVENT`。 |
+
+返回非零表示成功，返回 `FALSE` 表示失败。
+
+只有 operation 已经最终完成后，才能关闭其 `hEvent`。
+
+### 8.3 event 只是“完成通知灯”
+
+可以把 event 理解为一盏只表示“operation 是否已经结束”的通知灯：
+
+| event 状态 | 等待行为 | 能否判断 operation 成功 |
+| --- | --- | --- |
+| nonsignaled | `WSAWaitForMultipleEvents()` 正常情况下继续等待 | 不能，operation 通常还未结束 |
+| signaled | `WSAWaitForMultipleEvents()` 正常返回 | 仍然不能，只能说明 operation 已结束 |
+
+```text
+WSACreateEvent 创建 event
+  → 初始为 nonsignaled
+  → operation 最终结束
+  → Windows 将 event 设为 signaled
+  → 应用再通过 WSAGetOverlappedResult 读取成功、失败和字节数
+```
+
+本阶段的一次性 receive 完成后直接关闭 event；复用同一个 event 的步骤在 19.1 节说明。
+
+### 8.4 当前对象关系
+
+```text
+OVERLAPPED.hEvent ──保存──> eventHandle
+WSABUF.buf         ──指向──> storage.data()
+```
+
+此时尚未提交 operation，所有对象仍可安全销毁。
+
+---
+
+## 9. 提交一次 `WSARecv()`
 
 ```cpp
 DWORD flags{0};
-DWORD immediateBytes{0};
 
 int const result{WSARecv(socketHandle,
                          &nativeBuffer,
                          1,
-                         &immediateBytes,
+                         nullptr,
                          &flags,
                          &overlapped,
                          nullptr)};
 ```
 
-### 7.1 `WSARecv()` 参数说明
-
-函数原型可以简化理解为：
+### 9.1 `WSARecv()` 参数说明
 
 ```cpp
 int WSARecv(
@@ -310,85 +432,427 @@ int WSARecv(
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
 ```
 
-| 参数 | 示例值 | 作用与生命周期要求 |
+1. **`s`**
+   - 示例值：`socketHandle`。
+   - 作用：指定已连接且支持 Overlapped I/O 的 socket。
+2. **`lpBuffers`**
+   - 示例值：`&nativeBuffer`。
+   - 作用：指向 `WSABUF` 数组首元素。
+   - 生命周期：`WSABUF` 指向的真实 buffer 必须存活到 operation 最终完成。
+3. **`dwBufferCount`**
+   - 示例值：`1`。
+   - 作用：指定 `WSABUF` 数组中的元素数量；当前示例只有一个。
+4. **`lpNumberOfBytesRecvd`**
+   - 示例值：`nullptr`。
+   - 作用：Overlapped I/O 下不在提交阶段读取接收字节数；最终字节数统一由 `WSAGetOverlappedResult()` 取得。
+5. **`lpFlags`**
+   - 示例值：`&flags`，调用前 `flags` 为 `0`。
+   - 作用：输入 receive 标志。operation 延迟完成时，该变量不会得到最终 flags；最终值通过 `WSAGetOverlappedResult()` 的 `lpdwFlags` 参数取得。
+6. **`lpOverlapped`**
+   - 示例值：`&overlapped`。
+   - 作用：标识本次 operation。
+   - 生命周期：最终完成前必须保持对象存活且地址稳定。
+7. **`lpCompletionRoutine`**
+   - 示例值：`nullptr`。
+   - 作用：当前示例使用事件通知，不使用 completion routine。
+
+### 9.2 三种提交结果
+
+1. **返回 `0`**
+   - 含义：operation 已立即完成，不读取错误码。
+   - 下一步：不等待，调用 `WSAGetOverlappedResult()` 取得最终结果。
+2. **返回 `SOCKET_ERROR`，错误码为 `WSA_IO_PENDING`**
+   - 含义：提交成功，但 operation 尚未完成。
+   - 下一步：等待事件。
+3. **返回 `SOCKET_ERROR`，错误码为其他值**
+   - 含义：同步投递失败，operation 没有进入在途状态。
+   - 下一步：在当前路径处理错误，不再等待完成通知。
+
+提交返回值只用于判断“是否需要等待”，不从 `lpNumberOfBytesRecvd` 读取字节数。只要 operation 提交成功，无论立即完成还是稍后完成，都通过 `WSAGetOverlappedResult()` 取得统一的最终结果。
+
+必须把“提交结果”和“最终完成结果”分开：
+
+| 阶段 | 要回答的问题 | 取得结果的方式 |
 | --- | --- | --- |
-| `s` | `socketHandle` | 已连接且支持 Overlapped I/O 的 socket。必须在提交时有效。 |
-| `lpBuffers` | `&nativeBuffer` | `WSABUF` 数组首地址。数组描述接收内存；它指向的真实 buffer 必须存活到最终完成。 |
-| `dwBufferCount` | `1` | `lpBuffers` 中的元素数量。示例只有一个 `WSABUF`，所以传 `1`。 |
-| `lpNumberOfBytesRecvd` | `&immediateBytes` | 立即完成时接收字节数的输出位置。若返回 `WSA_IO_PENDING`，不能把这里的值当作最终字节数，应从完成结果取得。 |
-| `lpFlags` | `&flags` | 输入/输出接收标志。提交时可传入 `MSG_PEEK` 等标志；普通接收初始化为 `0`。最终 flags 可由完成 API 返回。 |
-| `lpOverlapped` | `&overlapped` | 标识本次操作的 `OVERLAPPED`。在最终完成前必须保持对象存活、地址稳定且不得复用。 |
-| `lpCompletionRoutine` | `nullptr` | 可选 completion routine。事件模式和 IOCP 模式不使用回调时传空。 |
+| 提交阶段 | Windows 是否接受了这次 operation？是否需要等待？ | `WSARecv()` 返回值和紧接着读取的 `WSAGetLastError()` |
+| 完成阶段 | operation 最终成功还是失败？实际传输了多少字节？ | `WSAGetOverlappedResult()` |
 
-返回值只表示“提交时发生了什么”，最终业务结果仍需结合完成模型判断。
+> `WSA_IO_PENDING` 只表示提交成功，不能证明 operation 最终一定成功。
 
-### 7.2 返回 `0`：立即完成
-
-在纯事件模式中：
-
-```text
-WSARecv 返回 0
-  → 操作已经完成
-  → immediateBytes 是完成字节数
-  → 当前路径可以处理最终结果
-```
-
-进入 IOCP 阶段后要改变处理方式：socket 关联 completion port 后，即使操作立即成功，默认仍会产生 completion packet。项目没有开启“成功时跳过 completion”的模式，所以项目必须让 completion worker 统一收尾，不能在提交线程提前释放 operation。
-
-### 7.3 返回 `SOCKET_ERROR`，错误为 `WSA_IO_PENDING`
+判断代码：
 
 ```cpp
-if (result == SOCKET_ERROR)
+if (result == 0)
+{
+    // 立即完成。
+}
+else
 {
     int const error{WSAGetLastError()};
     if (error == WSA_IO_PENDING)
     {
-        // 正常异步路径，操作已经成功进入在途状态。
+        // 正常异步路径。
+    }
+    else
+    {
+        // 同步投递失败。
     }
 }
 ```
 
-此时不能：
+### 9.3 `WSA_IO_PENDING` 不是失败
 
-- 销毁或复用 `OVERLAPPED`。
-- 销毁、移动或扩容 buffer。
-- 把 `WSA_IO_PENDING` 当作连接失败。
-
-### 7.4 返回 `SOCKET_ERROR`，错误不是 `WSA_IO_PENDING`
-
-表示同步投递失败：
+它表示：
 
 ```text
-操作没有进入在途状态
-  → 当前提交路径负责回收 operation
-  → 回滚 pending 计数
-  → 根据错误决定是否关闭连接
+Windows 已接受 operation
+  → operation 仍在进行
+  → OVERLAPPED 和 WSABUF.buf 指向的真实 buffer 必须继续存活
 ```
 
-### 7.5 判断表
+`WSABUF` 描述符已经由服务提供者捕获，不要把“描述符对象”和“描述符指向的真实 buffer”混为一谈。
 
-| 返回结果 | 是否成功提交 | 是否需要未来完成路径 | 回收者 |
-| --- | --- | --- | --- |
-| `0` | 是，且立即完成 | 事件模式不需要；IOCP 默认需要 | 取决于完成模型 |
-| `SOCKET_ERROR + WSA_IO_PENDING` | 是 | 需要 | 完成路径 |
-| `SOCKET_ERROR + 其他错误` | 否 | 不需要普通完成路径 | 当前提交路径 |
+此时不能离开对象作用域，也不能重新使用该 `OVERLAPPED`。
 
 ---
 
-## 8. 关键示例：事件版一次 receive
+## 10. 等待事件
 
-下面只展示 operation、提交、等待和最终结果。省略 `WSAStartup()`、bind、listen、accept 等阶段二已经学习过的内容。
+只有 `WSARecv()` 返回 `WSA_IO_PENDING` 时才需要等待未来完成。
 
-### 8.1 operation 自己拥有事件和 buffer
+```cpp
+WSAEVENT events[]{eventHandle};
 
-本节首次使用两个事件 API：
+DWORD const waitResult{WSAWaitForMultipleEvents(
+    1,
+    events,
+    TRUE,
+    WSA_INFINITE,
+    FALSE)};
+```
 
-| 函数 | 参数 | 返回值与作用 |
+### 10.1 `WSAWaitForMultipleEvents()` 参数说明
+
+```cpp
+DWORD WSAWaitForMultipleEvents(
+    DWORD cEvents,
+    const WSAEVENT* lphEvents,
+    BOOL fWaitAll,
+    DWORD dwTimeout,
+    BOOL fAlertable);
+```
+
+| 参数 | 示例值 | 作用 |
 | --- | --- | --- |
-| `WSACreateEvent()` | 无 | 创建一个初始为 nonsignaled 的 Winsock event。成功返回 `WSAEVENT`，失败返回 `WSA_INVALID_EVENT`。 |
-| `WSACloseEvent(hEvent)` | `hEvent` 是 `WSACreateEvent()` 返回的事件 | 成功返回 `TRUE`，失败返回 `FALSE`。只有确认没有在途操作再使用该事件后才能关闭。 |
+| `cEvents` | `1` | 事件数组中的元素数量。 |
+| `lphEvents` | `events` | 事件数组首地址。 |
+| `fWaitAll` | `TRUE` | 等待全部事件；这里只有一个事件。 |
+| `dwTimeout` | `WSA_INFINITE` | 无限等待，使当前流程不涉及超时后的取消。 |
+| `fAlertable` | `FALSE` | 不使用 completion routine，因此不需要 alertable wait。 |
 
-`OVERLAPPED::hEvent` 保存该事件。Windows 完成操作后设置事件，等待线程据此进入最终结果查询。
+主要返回值：
+
+- `WSA_WAIT_EVENT_0`：第一个事件满足条件。
+- `WSA_WAIT_FAILED`：等待失败，调用 `WSAGetLastError()`。
+
+当前流程只等待一个事件并使用无限超时；超时后的取消不在该流程中处理。
+
+---
+
+## 11. 取得最终结果
+
+`WSARecv()` 返回 `0` 时，operation 已经完成；返回 `WSA_IO_PENDING` 时，要先等到事件 signaled。两条成功提交路径最终都调用：
+
+```cpp
+DWORD transferredBytes{0};
+DWORD completedFlags{0};
+
+BOOL const completed{WSAGetOverlappedResult(
+    socketHandle,
+    &overlapped,
+    &transferredBytes,
+    FALSE,
+    &completedFlags)};
+```
+
+### 11.1 `WSAGetOverlappedResult()` 参数说明
+
+```cpp
+BOOL WSAGetOverlappedResult(
+    SOCKET s,
+    LPWSAOVERLAPPED lpOverlapped,
+    LPDWORD lpcbTransfer,
+    BOOL fWait,
+    LPDWORD lpdwFlags);
+```
+
+| 参数 | 示例值 | 作用 |
+| --- | --- | --- |
+| `s` | `socketHandle` | 提交该 receive 的 socket。 |
+| `lpOverlapped` | `&overlapped` | 提交时使用的同一个 `OVERLAPPED`。 |
+| `lpcbTransfer` | `&transferredBytes` | 输出最终传输字节数。 |
+| `fWait` | `FALSE` | 调用前已经通过返回值或事件确认 operation 完成，所以这里只查询，不再次等待。 |
+| `lpdwFlags` | `&completedFlags` | 输出该 operation 的最终 flags。 |
+
+返回值：
+
+- 非零：operation 成功完成。
+- `FALSE`：operation 失败，调用 `WSAGetLastError()` 取得最终错误。
+
+### 11.2 为什么不能只看事件
+
+事件只表示 operation 已经结束，不表示它一定成功。最终成功、错误和字节数必须通过 `WSAGetOverlappedResult()` 取得。
+
+### 11.3 何时可以释放对象
+
+只有以下两条路径允许释放：
+
+```text
+WSARecv 返回 0，立即完成
+  → WSAGetOverlappedResult 返回最终结果
+
+或
+
+WSARecv 返回 WSA_IO_PENDING
+  → event 变为 signaled
+  → WSAGetOverlappedResult 返回最终结果
+```
+
+同步投递失败没有进入在途状态，也可以由当前路径直接释放。
+
+---
+
+## 12. 组合成一次完整 receive
+
+以下函数完整展示一次 event-based receive。函数返回前会等待 operation 最终完成，因此局部变量不会提前失效。
+
+阅读代码时按五个阶段划分：
+
+1. 创建 event、`OVERLAPPED`、`WSABUF` 和真实 buffer。
+2. 调用 `WSARecv()`，判断立即完成、pending 或同步失败。
+3. 仅在 pending 路径等待 event。
+4. 调用 `WSAGetOverlappedResult()` 取得最终错误和 `transferredBytes`。
+5. 关闭 event，再把结果分类为数据、对端关闭或失败。
+
+```cpp
+enum class ReceiveResultKind
+{
+    Data,
+    PeerClosed,
+    Failed,
+};
+
+struct ReceiveResult final
+{
+    ReceiveResultKind kind{ReceiveResultKind::Failed};
+    DWORD transferredBytes{0};
+    int error{0};
+};
+
+[[nodiscard]] ReceiveResult receiveOneChunk(
+    SOCKET _socket,
+    std::array<char, 8192>& _storage)
+{
+    WSAEVENT eventHandle{WSACreateEvent()};
+    if (eventHandle == WSA_INVALID_EVENT)
+    {
+        return {ReceiveResultKind::Failed, 0, WSAGetLastError()};
+    }
+
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = eventHandle;
+
+    WSABUF nativeBuffer{};
+    nativeBuffer.buf = _storage.data();
+    nativeBuffer.len = static_cast<ULONG>(_storage.size());
+
+    DWORD flags{0};
+    int const result{WSARecv(_socket,
+                             &nativeBuffer,
+                             1,
+                             nullptr,
+                             &flags,
+                             &overlapped,
+                             nullptr)};
+
+    int waitError{0};
+    if (result == SOCKET_ERROR)
+    {
+        int const submitError{WSAGetLastError()};
+        if (submitError != WSA_IO_PENDING)
+        {
+            static_cast<void>(WSACloseEvent(eventHandle));
+            return {ReceiveResultKind::Failed, 0, submitError};
+        }
+
+        WSAEVENT events[]{eventHandle};
+        DWORD const waitResult{WSAWaitForMultipleEvents(
+            1,
+            events,
+            TRUE,
+            WSA_INFINITE,
+            FALSE)};
+
+        if (waitResult == WSA_WAIT_FAILED)
+        {
+            waitError = WSAGetLastError();
+        }
+    }
+
+    DWORD transferredBytes{0};
+    DWORD completedFlags{0};
+    BOOL const completed{WSAGetOverlappedResult(
+        _socket,
+        &overlapped,
+        &transferredBytes,
+        TRUE,
+        &completedFlags)};
+
+    int finalError{waitError};
+    if (completed == FALSE)
+    {
+        finalError = WSAGetLastError();
+    }
+
+    static_cast<void>(WSACloseEvent(eventHandle));
+
+    if (finalError != 0)
+    {
+        return {ReceiveResultKind::Failed, 0, finalError};
+    }
+    if (transferredBytes == 0)
+    {
+        return {ReceiveResultKind::PeerClosed, 0, 0};
+    }
+    return {ReceiveResultKind::Data, transferredBytes, 0};
+}
+```
+
+### 12.1 自定义函数参数说明
+
+| 参数 | 作用 | 生命周期要求 |
+| --- | --- | --- |
+| `_socket` | 已连接且支持 Overlapped I/O 的 socket。 | 函数返回前保持有效。 |
+| `_storage` | 调用者提供的接收 buffer。 | 函数会等待最终完成，因此引用在整个 operation 期间有效。 |
+
+返回 `ReceiveResult`：
+
+- `Data`：`_storage[0..transferredBytes)` 有效。
+- `PeerClosed`：本例提交的是非零长度 TCP receive，因此零字节成功完成表示对端正常关闭发送方向。
+- `Failed`：`error` 保存错误码。
+
+### 12.2 为什么 `WSAGetOverlappedResult()` 使用 `TRUE`
+
+| 调用前的情况 | `TRUE` 的行为 |
+| --- | --- |
+| `WSARecv()` 返回 `0` | operation 已经完成，函数立即返回。 |
+| pending 且 event 已变为 signaled | operation 已经完成，函数立即返回。 |
+| event 等待发生异常 | 若 operation 仍未结束，继续等待其最终完成，避免局部 `OVERLAPPED` 和 buffer 提前失效。 |
+
+`fWait` 只有在 operation 使用 event-based completion notification 时才能设为 `TRUE`；当前示例满足这个前提。
+
+等待异常后的取消与排空属于安全停机主题。
+
+---
+
+## 13. 正确使用 receive 结果
+
+```cpp
+std::array<char, 8192> storage{};
+ReceiveResult const result{receiveOneChunk(socketHandle, storage)};
+
+if (result.kind == ReceiveResultKind::Data)
+{
+    processBytes(storage.data(), result.transferredBytes);
+}
+else if (result.kind == ReceiveResultKind::PeerClosed)
+{
+    closeAfterPeerShutdown();
+}
+else
+{
+    reportWinsockError(result.error);
+}
+```
+
+### 13.1 示例辅助函数参数
+
+| 函数 | 参数 | 作用 |
+| --- | --- | --- |
+| `processBytes(_data, _size)` | `_data` 是有效数据首地址；`_size` 是实际字节数 | 把字节追加到协议接收缓冲区。 |
+| `closeAfterPeerShutdown()` | 无 | 对端正常关闭后释放当前同步练习中的连接资源。 |
+| `reportWinsockError(_error)` | `_error` 是已保存的 Winsock 错误码 | 输出错误，不重新读取可能已变化的 last error。 |
+
+### 13.2 只处理有效范围
+
+错误：
+
+```cpp
+processBytes(storage.data(), storage.size());
+```
+
+正确：
+
+```cpp
+processBytes(storage.data(), result.transferredBytes);
+```
+
+buffer 容量不等于本次完成字节数。
+
+### 13.3 TCP 仍然没有消息边界
+
+一次 receive completion 可能得到：
+
+- 半个 Packet。
+- 一个完整 Packet。
+- 多个 Packet。
+
+Overlapped I/O 不会改变 TCP 字节流语义。收到的字节仍要追加到累计缓冲区，再循环解析完整 Packet。
+
+---
+
+## 14. 局部变量何时安全、何时危险
+
+### 14.1 局部变量安全的条件
+
+```text
+创建局部 OVERLAPPED、event、buffer
+  → 提交 WSARecv
+  → 在同一函数中等待最终完成
+  → 处理结果
+  → 函数返回
+```
+
+所有局部对象都活到 operation 最终完成。
+
+### 14.2 以下代码为什么危险
+
+```cpp
+void postReceiveAndReturn(SOCKET _socket)
+{
+    std::array<char, 8192> storage{};
+    WSABUF nativeBuffer{
+        static_cast<ULONG>(storage.size()), storage.data()};
+    OVERLAPPED overlapped{};
+
+    DWORD flags{0};
+    static_cast<void>(WSARecv(_socket,
+                              &nativeBuffer,
+                              1,
+                              nullptr,
+                              &flags,
+                              &overlapped,
+                              nullptr));
+}  // operation 可能仍在途，三个对象却全部失效。
+```
+
+问题不是“栈对象”本身，而是函数在最终完成前返回。
+
+---
+
+## 15. 把对象聚合为 `ReceiveOperation`
+
+在理解单次流程后，再把相关对象放入一个类型：
 
 ```cpp
 class ReceiveOperation final
@@ -430,16 +894,6 @@ public:
         return &this->m_nativeBuffer;
     }
 
-    [[nodiscard]] WSAEVENT event() const noexcept
-    {
-        return this->m_event;
-    }
-
-    [[nodiscard]] char const* data() const noexcept
-    {
-        return this->m_storage.data();
-    }
-
 private:
     OVERLAPPED m_overlapped{};
     std::array<char, 8192> m_storage{};
@@ -448,324 +902,84 @@ private:
 };
 ```
 
-设计要点：
-
-1. `OVERLAPPED`、buffer、`WSABUF` 和 event 具有同一生命周期。
-2. 类型禁止复制和移动，避免内部指针指向旧对象。
-3. `WSABUF` 指向 operation 自己拥有的 `m_storage`。
-4. 每次 receive 创建一个新的 `ReceiveOperation`。
-
-### 8.2 提交并取得最终结果
-
-本节使用三个完成与取消 API。
-
-#### `WSAWaitForMultipleEvents()`
-
-```cpp
-DWORD WSAWaitForMultipleEvents(
-    DWORD cEvents,
-    const WSAEVENT* lphEvents,
-    BOOL fWaitAll,
-    DWORD dwTimeout,
-    BOOL fAlertable);
-```
-
-| 参数 | 示例值 | 作用 |
-| --- | --- | --- |
-| `cEvents` | `1` | `lphEvents` 数组中的事件数量。 |
-| `lphEvents` | `&eventHandle` | 要等待的事件数组首地址。数组在调用期间必须有效。 |
-| `fWaitAll` | `TRUE` | `TRUE` 表示等待全部事件；`FALSE` 表示任一事件。这里只有一个事件，两者结果等价。 |
-| `dwTimeout` | `10'000` | 等待毫秒数。也可使用 `WSA_INFINITE` 表示无限等待。 |
-| `fAlertable` | `FALSE` | 是否进行 alertable wait。示例不使用 completion routine，因此传 `FALSE`。 |
-
-主要返回值：
-
-- `WSA_WAIT_EVENT_0 + index`：对应事件满足等待条件。
-- `WSA_WAIT_TIMEOUT`：在超时时间内没有满足条件。
-- `WSA_WAIT_FAILED`：等待失败，调用 `WSAGetLastError()` 取得错误码。
-
-#### `CancelIoEx()`
-
-```cpp
-BOOL CancelIoEx(
-    HANDLE hFile,
-    LPOVERLAPPED lpOverlapped);
-```
-
-| 参数 | 示例值 | 作用 |
-| --- | --- | --- |
-| `hFile` | `reinterpret_cast<HANDLE>(_socket)` | 发起 I/O 的 handle。socket 在这里转换为 Win32 `HANDLE` 视图，仅用于该 API。 |
-| `lpOverlapped` | `_operation.overlapped()` | 指定要取消的那一次操作。传空表示请求取消该 handle 上由当前进程发起的全部匹配操作，本讲义不使用该方式。 |
-
-返回非零表示取消请求已发出；返回 `FALSE` 时调用 `GetLastError()`。无论返回值如何，都不能据此直接释放 operation，仍需取得最终完成结果。
-
-#### `WSAGetOverlappedResult()`
-
-```cpp
-BOOL WSAGetOverlappedResult(
-    SOCKET s,
-    LPWSAOVERLAPPED lpOverlapped,
-    LPDWORD lpcbTransfer,
-    BOOL fWait,
-    LPDWORD lpdwFlags);
-```
-
-| 参数 | 示例值 | 作用 |
-| --- | --- | --- |
-| `s` | `_socket` | 提交该 operation 的 socket。 |
-| `lpOverlapped` | `_operation.overlapped()` | 要查询的具体操作，必须与提交时使用同一地址。 |
-| `lpcbTransfer` | `&transferredBytes` | 输出最终传输字节数。只有函数成功时才能按成功结果使用。 |
-| `fWait` | `TRUE` | `TRUE` 表示操作未完成时继续等待；`FALSE` 表示立即查询。教学示例使用 `TRUE` 保证离开前操作已结束。 |
-| `lpdwFlags` | `&flags` | 输出本次操作的最终 flags。 |
-
-成功返回 `TRUE`；失败返回 `FALSE`，调用 `WSAGetLastError()` 取得该 operation 的最终错误。
-
-#### 自定义示例函数参数
-
-| 函数 | 参数 | 作用 |
-| --- | --- | --- |
-| `makeSuccessfulReceive(_transferredBytes)` | `_transferredBytes` 是最终接收字节数 | 将 `0` 分类为 `PeerClosed`，将大于 `0` 分类为 `Data`。 |
-| `receiveOnceWithEvent(_socket, _operation)` | `_socket` 是已连接 socket；`_operation` 是尚未提交的新 operation | 提交一次 receive，必要时等待或取消，并返回最终分类、字节数和错误码。调用期间 `_operation` 必须持续存活。 |
-
-```cpp
-enum class ReceiveResultKind
-{
-    Data,
-    PeerClosed,
-    Failed,
-};
-
-struct ReceiveResult final
-{
-    ReceiveResultKind kind{ReceiveResultKind::Failed};
-    DWORD transferredBytes{0};
-    int error{0};
-};
-
-[[nodiscard]] ReceiveResult makeSuccessfulReceive(DWORD _transferredBytes) noexcept
-{
-    return {_transferredBytes == 0 ? ReceiveResultKind::PeerClosed
-                                   : ReceiveResultKind::Data,
-            _transferredBytes,
-            0};
-}
-
-[[nodiscard]] ReceiveResult receiveOnceWithEvent(SOCKET _socket,
-                                                  ReceiveOperation& _operation)
-{
-    DWORD flags{0};
-    DWORD immediateBytes{0};
-
-    int const result{WSARecv(_socket,
-                             _operation.nativeBuffer(),
-                             1,
-                             &immediateBytes,
-                             &flags,
-                             _operation.overlapped(),
-                             nullptr)};
-
-    if (result == 0)
-    {
-        return makeSuccessfulReceive(immediateBytes);
-    }
-
-    int const submitError{WSAGetLastError()};
-    if (submitError != WSA_IO_PENDING)
-    {
-        return {ReceiveResultKind::Failed, 0, submitError};
-    }
-
-    WSAEVENT eventHandle{_operation.event()};
-    DWORD const waitResult{
-        WSAWaitForMultipleEvents(1, &eventHandle, TRUE, 10'000, FALSE)};
-
-    if (waitResult != WSA_WAIT_EVENT_0)
-    {
-        static_cast<void>(CancelIoEx(
-            reinterpret_cast<HANDLE>(_socket),
-            _operation.overlapped()));
-    }
-
-    DWORD transferredBytes{0};
-    BOOL const completed{WSAGetOverlappedResult(_socket,
-                                                _operation.overlapped(),
-                                                &transferredBytes,
-                                                TRUE,
-                                                &flags)};
-    if (completed == FALSE)
-    {
-        return {ReceiveResultKind::Failed, 0, WSAGetLastError()};
-    }
-
-    return makeSuccessfulReceive(transferredBytes);
-}
-```
-
-这段代码最重要的不是“等待十秒”，而是以下顺序：
+### 15.1 设计目的
 
 ```text
-提交成功进入 pending
-  → 等待 event
-  → 超时或等待异常时请求取消
-  → 无论取消请求结果如何，都调用 WSAGetOverlappedResult(..., TRUE, ...)
-  → 取得最终结果后才允许 ReceiveOperation 析构
+ReceiveOperation
+  ├─ m_overlapped：标识当前 receive operation
+  ├─ m_storage：拥有接收数据使用的真实内存
+  ├─ m_event：保存并负责关闭事件句柄
+  └─ m_nativeBuffer.buf：指向 m_storage，不拥有内存
 ```
 
-`WSAGetOverlappedResult()` 的 `fWait` 使用 `TRUE`，确保函数返回时操作已经进入最终完成状态。教学代码宁可继续等待，也不能在系统可能仍引用 operation 时提前离开作用域。
+### 15.2 为什么禁止复制和移动
 
-### 8.3 使用完成字节数
+`WSABUF::buf` 指向对象内部的 `m_storage`。复制或移动后，内部指针可能仍指向旧对象地址。初学版本直接禁止复制和移动，避免额外复杂度。
 
-```cpp
-ReceiveOperation operation;
-ReceiveResult const result{receiveOnceWithEvent(socketHandle, operation)};
+### 15.3 析构前置条件
 
-if (result.kind == ReceiveResultKind::Data)
-{
-    processBytes(operation.data(), result.transferredBytes);
-}
-else if (result.kind == ReceiveResultKind::PeerClosed)
-{
-    beginConnectionClose();
-}
-else
-{
-    reportWinsockError(result.error);
-    beginConnectionClose();
-}
-```
+该类型只聚合资源，不会自动等待在途 operation。使用者仍必须保证：
 
-上述业务辅助函数只是示意：
+> `ReceiveOperation` 析构前，对应 receive 已经最终完成。
 
-| 函数 | 参数 | 作用 |
-| --- | --- | --- |
-| `processBytes(_data, _size)` | `_data` 是有效字节首地址；`_size` 是 `transferredBytes` | 把本次收到的有效范围追加到协议接收缓冲区。 |
-| `reportWinsockError(_error)` | `_error` 是 Winsock 错误码 | 记录错误；不要在函数内部再次读取可能已被覆盖的 last error。 |
-| `beginConnectionClose()` | 无 | 进入幂等连接关闭流程。 |
-
-只能处理 `[0, transferredBytes)`：
-
-```cpp
-// 错误：把整个容量都当作有效数据。
-processBytes(operation.data(), 8192);
-
-// 正确：只使用本次完成范围。
-processBytes(operation.data(), result.transferredBytes);
-```
-
-一次 receive completion 只表示“一批 TCP 字节”，仍然可能是半包、一个完整 Packet 或多个 Packet。
+不要误以为“使用类封装”就自动解决异步生命周期。
 
 ---
 
-## 9. 为什么普通局部变量经常出错
+## 16. 顺序执行多次 receive
 
-错误示例：
+多次 receive 可以先按以下顺序执行：
+
+```text
+创建一次 operation
+  → 提交
+  → 等待最终完成
+  → 处理字节
+  → operation 析构
+  → 创建下一次 operation
+```
+
+示意代码：
 
 ```cpp
-void postReceiveAndReturn(SOCKET _socket)
+while (true)
 {
     std::array<char, 8192> storage{};
-    WSABUF nativeBuffer{
-        static_cast<ULONG>(storage.size()), storage.data()};
-    OVERLAPPED overlapped{};
+    ReceiveResult const result{receiveOneChunk(socketHandle, storage)};
 
-    DWORD flags{0};
-    int const result{WSARecv(_socket,
-                             &nativeBuffer,
-                             1,
-                             nullptr,
-                             &flags,
-                             &overlapped,
-                             nullptr)};
+    if (result.kind == ReceiveResultKind::Failed)
+    {
+        reportWinsockError(result.error);
+        break;
+    }
+    if (result.kind == ReceiveResultKind::PeerClosed)
+    {
+        break;
+    }
 
-    static_cast<void>(result);
-}  // 函数返回后，三个对象全部失效。
+    processBytes(storage.data(), result.transferredBytes);
+}
 ```
 
-如果 `WSARecv()` 返回 `WSA_IO_PENDING`，Windows 仍可能访问：
-
-- `&overlapped`。
-- `nativeBuffer.buf`。
-- `storage.data()`。
-
-函数返回后这些地址都不再有效，属于 use-after-free。未立即崩溃不代表代码正确。
-
-栈对象并非绝对不能用于 Overlapped I/O。只有当作用域明确等待最终完成后才离开时，才是安全的：
-
-```text
-创建栈对象
-  → 提交
-  → 在同一作用域等待最终完成
-  → 处理结果
-  → 离开作用域
-```
-
-真正的异步架构不会阻塞在原作用域，因此通常使用地址稳定的堆 operation。
+这个循环在等待时仍会阻塞当前线程，因此不是最终高并发架构。它的目标只是验证 Overlapped I/O 的提交和生命周期。
 
 ---
 
-## 10. 取消不是立即结束
+## 17. 学习 `WSASend()`
 
-错误理解：
-
-```text
-CancelIoEx()
-  → Windows 已经忘记 operation
-  → 立即 delete operation
-```
-
-正确理解：
-
-```text
-CancelIoEx()
-  → 发出取消请求
-  → 原操作仍需进入最终完成状态
-  → 事件、completion routine 或 IOCP 返回最终结果
-  → 应用消费最终结果
-  → 最后释放 operation
-```
-
-### 10.1 `ERROR_NOT_FOUND` 竞态
-
-`CancelIoEx()` 返回 `FALSE` 且 `GetLastError()==ERROR_NOT_FOUND`，可能表示目标操作刚好已经完成，取消请求没有找到仍在途的操作。
-
-这不表示可以跳过完成协议。应用仍要取得该操作的最终结果。
-
-### 10.2 常见取消结果
-
-取消 operation 的最终错误通常表示操作被中止。取消 completion 仍是一次需要处理的完成结果，不能因为它“不包含业务数据”就忽略 operation 回收。
-
----
-
-## 11. receive 完成结果分类
-
-| 完成状态 | 字节数 | 含义 | 处理 |
-| --- | ---: | --- | --- |
-| 成功 | `> 0` | 收到 TCP 字节 | 追加到连接接收缓冲区 |
-| 成功 | `0` | 对端正常关闭发送方向 | 进入连接关闭流程 |
-| 失败 | 不使用 | 网络或 socket 错误 | 记录错误并幂等关闭 |
-| 取消 | 不使用 | 应用请求结束操作 | 回收 operation，按关闭状态处理 |
-
-不要把成功且零字节当作“本次暂时没数据”。对于 byte-stream socket，它表示对端正常关闭。
-
----
-
-## 12. Overlapped send 的关键点
-
-`WSASend()` 的典型调用：
+关键调用：
 
 ```cpp
-DWORD immediateBytes{0};
-
 int const result{WSASend(socketHandle,
-                         &operation.nativeBuffer,
+                         &nativeBuffer,
                          1,
-                         &immediateBytes,
+                         nullptr,
                          0,
-                         &operation,
+                         &overlapped,
                          nullptr)};
 ```
 
-函数原型可以简化理解为：
+### 17.1 `WSASend()` 参数说明
 
 ```cpp
 int WSASend(
@@ -778,126 +992,248 @@ int WSASend(
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
 ```
 
-| 参数 | 示例值 | 作用与生命周期要求 |
-| --- | --- | --- |
-| `s` | `socketHandle` | 已连接且支持 Overlapped I/O 的 socket。 |
-| `lpBuffers` | `&operation.nativeBuffer` | 待发送 `WSABUF` 数组首地址。它指向的数据在最终完成前不能修改、移动或销毁。 |
-| `dwBufferCount` | `1` | `WSABUF` 元素数量。 |
-| `lpNumberOfBytesSent` | `&immediateBytes` | 立即完成时输出发送字节数；pending 路径应从最终完成结果取得字节数。 |
-| `dwFlags` | `0` | 发送标志。普通 TCP 发送使用 `0`。 |
-| `lpOverlapped` | `&operation` | 标识本次 send 的 `OVERLAPPED`。示例中 `SendOperation` 继承 `OVERLAPPED`。 |
-| `lpCompletionRoutine` | `nullptr` | 可选 completion routine。事件或 IOCP 模式不使用回调时传空。 |
+1. **`s`**
+   - 示例值：`socketHandle`。
+   - 作用：指定已连接且支持 Overlapped I/O 的 socket。
+2. **`lpBuffers`**
+   - 示例值：`&nativeBuffer`。
+   - 作用：指向待发送的 `WSABUF` 数组。
+   - 生命周期：真实发送数据必须存活到 operation 最终完成。
+3. **`dwBufferCount`**
+   - 示例值：`1`。
+   - 作用：指定 `WSABUF` 数组中的元素数量。
+4. **`lpNumberOfBytesSent`**
+   - 示例值：`nullptr`。
+   - 作用：Overlapped I/O 下不在提交阶段读取发送字节数；最终发送字节数统一由 `WSAGetOverlappedResult()` 取得。
+5. **`dwFlags`**
+   - 示例值：`0`。
+   - 作用：指定发送标志；普通 TCP 发送不使用特殊标志。
+6. **`lpOverlapped`**
+   - 示例值：`&overlapped`。
+   - 作用：标识本次 send operation。
+   - 生命周期：最终完成前必须保持对象存活且地址稳定。
+7. **`lpCompletionRoutine`**
+   - 示例值：`nullptr`。
+   - 作用：当前示例使用事件通知，不使用 completion routine。
 
-返回 `0`、`SOCKET_ERROR + WSA_IO_PENDING` 和其他错误的含义与 `WSARecv()` 相同。
+三种提交结果与 `WSARecv()` 相同：
 
-`WSASend()` 使用同一套提交规则：
+- 返回 `0`：立即完成，不需要等待。
+- `SOCKET_ERROR + WSA_IO_PENDING`：正常 pending，需要等待事件。
+- `SOCKET_ERROR + 其他错误`：同步投递失败。
 
-```text
-立即完成
-WSA_IO_PENDING
-同步投递失败
-```
+前两种情况都要通过 `WSAGetOverlappedResult()` 取得本次最终发送字节数。
 
-### 12.1 send operation 必须拥有发送数据
+### 17.2 receive 与 send 的相同点和不同点
 
-错误示例：
-
-```cpp
-std::string response{"response"};
-postSend(socketHandle, response.data(), response.size());
-response.clear();  // operation 可能仍在使用原地址。
-```
-
-这里的 `postSend(_socket, _data, _size)` 是错误示意中的辅助函数：
-
-| 参数 | 作用 |
-| --- | --- |
-| `_socket` | 接收发送操作的连接 socket。 |
-| `_data` | 待发送数据首地址；错误示例没有保证该地址活到 completion。 |
-| `_size` | 待发送字节数。 |
-
-推荐结构：
-
-```cpp
-struct SendOperation final : OVERLAPPED
-{
-    explicit SendOperation(std::vector<char> _bytes)
-        : OVERLAPPED{}, sendBytes{std::move(_bytes)}
-    {
-        this->refreshBuffer();
-    }
-
-    void refreshBuffer() noexcept
-    {
-        this->nativeBuffer.buf = this->sendBytes.data() + this->sendOffset;
-        this->nativeBuffer.len = static_cast<ULONG>(
-            this->sendBytes.size() - this->sendOffset);
-    }
-
-    std::vector<char> sendBytes;
-    std::size_t sendOffset{0};
-    WSABUF nativeBuffer{};
-};
-```
-
-`SendOperation(_bytes)` 的 `_bytes` 按值接收完整发送数据，再移动到 `sendBytes`，从而把数据所有权交给 operation。`refreshBuffer()` 没有形参，它根据成员 `sendOffset` 重新计算剩余数据的地址和长度。
-
-`nativeBuffer` 只观察 `sendBytes`，真正的数据由 operation 拥有。
-
-### 12.2 部分发送
-
-一次 send completion 不保证覆盖全部数据：
-
-```cpp
-operation->sendOffset += transferredBytes;
-
-if (operation->sendOffset < operation->sendBytes.size())
-{
-    operation->refreshBuffer();
-    postSendAgain(std::move(operation));
-    return;
-}
-
-finishCurrentSend();
-```
-
-示意辅助函数：
-
-| 函数 | 参数 | 作用 |
-| --- | --- | --- |
-| `postSendAgain(_operation)` | `_operation` 是当前 send operation 的唯一所有权 | 把尚未发送完的 operation 再次提交；调用后当前作用域不再拥有它。 |
-| `finishCurrentSend()` | 无 | 标记当前发送项完成，并根据发送队列决定是否继续下一项。 |
-
-推演：
+两者的完成流程相同：
 
 ```text
-sendBytes.size = 1000
-sendOffset = 0
-
-第一次完成 400
-  → sendOffset = 400
-  → 重新投递 [400, 1000)
-
-第二次完成 600
-  → sendOffset = 1000
-  → 当前发送项完成
+准备 OVERLAPPED、WSABUF、真实 buffer 和 event
+  → 提交 WSARecv 或 WSASend
+  → 判断立即完成、pending 或同步失败
+  → pending 时等待 event
+  → WSAGetOverlappedResult 取得最终结果
+  → operation 最终完成后释放或复用相关对象
 ```
 
-只有前一次 completion 已经被消费后，才能重新使用该 operation 投递剩余部分。
+真正需要区分的是 buffer 的方向和完成后的处理：
+
+| 对比项 | receive | send |
+| --- | --- | --- |
+| Windows 如何使用 buffer | 向 buffer 写入收到的数据 | 从 buffer 读取待发送数据 |
+| 在途期间应用能否访问 buffer | 不能读取或修改 | 不能读取、修改或释放 |
+| `transferredBytes == 0` | 表示对端正常关闭发送方向 | 表示没有发送进展，不能无限重投 |
+| 部分完成后的处理 | 处理本次收到的有效范围，再提交下一次 receive | 更新 offset，继续发送剩余范围 |
+
+> `WSASend()` 成功完成，只表示 Windows 传输层已经消费了相应 buffer，不表示远端应用已经收到或处理这些数据。
 
 ---
 
-## 13. 映射到项目 `IoOperation`
+## 18. send buffer 必须持续存活
 
-重点阅读：
+错误：
+
+```cpp
+std::string response{"hello"};
+postOverlappedSend(socketHandle, response.data(), response.size());
+response.clear();  // send 可能仍在使用旧地址。
+```
+
+这里的 `postOverlappedSend(_socket, _data, _size)` 是示意函数：`_socket` 是目标 socket，`_data` 是待发送字节首地址，`_size` 是字节数。错误的根因是该函数只接收地址和长度，没有取得数据所有权。
+
+正确思路：send operation 自己拥有发送数据。
+
+```cpp
+struct SendOperation final
+{
+    explicit SendOperation(std::vector<char> _bytes)
+        : bytes{std::move(_bytes)},
+          event{WSACreateEvent()}
+    {
+        this->overlapped.hEvent = this->event;
+        this->refreshBuffer();
+    }
+
+    ~SendOperation()
+    {
+        if (this->event != WSA_INVALID_EVENT)
+        {
+            WSACloseEvent(this->event);
+        }
+    }
+
+    [[nodiscard]] bool canSubmit() const noexcept
+    {
+        return this->event != WSA_INVALID_EVENT &&
+               this->offset < this->bytes.size();
+    }
+
+    SendOperation(SendOperation const&) = delete;
+    SendOperation(SendOperation&&) = delete;
+    SendOperation& operator=(SendOperation const&) = delete;
+    SendOperation& operator=(SendOperation&&) = delete;
+
+    void refreshBuffer() noexcept
+    {
+        if (this->offset >= this->bytes.size())
+        {
+            this->nativeBuffer = {};
+            return;
+        }
+
+        this->nativeBuffer.buf = this->bytes.data() + this->offset;
+        this->nativeBuffer.len = static_cast<ULONG>(
+            this->bytes.size() - this->offset);
+    }
+
+    std::vector<char> bytes;
+    std::size_t offset{0};
+    OVERLAPPED overlapped{};
+    WSABUF nativeBuffer{};
+    WSAEVENT event{WSA_INVALID_EVENT};
+};
+```
+
+### 18.1 构造函数参数
+
+| 参数 | 作用 |
+| --- | --- |
+| `_bytes` | 非空的完整待发送数据。按值接收后移动到 operation，使 operation 拥有数据。 |
+
+`refreshBuffer()` 没有参数，根据 `offset` 让 `nativeBuffer` 指向剩余字节。
+
+构造后必须先调用 `canSubmit()`；返回 `false` 表示 event 创建失败或没有剩余数据，不能提交 send。`refreshBuffer()` 对空数据和已全部发送的情况会生成空 `WSABUF`，避免对空地址做指针运算。
+
+析构函数会关闭 event，但前置条件仍是 send 已最终完成；不能依靠析构函数终止仍在途的 operation。
+
+---
+
+## 19. 处理部分发送
+
+假设总数据为 1000 bytes：
+
+```text
+第一次完成 400
+  → offset = 400
+  → 下一次发送 [400, 1000)
+
+第二次完成 600
+  → offset = 1000
+  → 整个业务 buffer 才发送完成
+```
+
+关键逻辑：
+
+以下代码只在 `WSASend()` 已成功完成，并且已经取得本次 `transferredBytes` 后执行：
+
+```cpp
+if (transferredBytes == 0)
+{
+    // 没有发送进展，进入错误处理，不再重投。
+}
+else
+{
+    operation.offset += transferredBytes;
+
+    if (operation.offset < operation.bytes.size())
+    {
+        // 剩余范围是 [operation.offset, operation.bytes.size())。
+        // 到这里仅更新了发送进度，尚未准备或提交下一次 operation。
+    }
+    else
+    {
+        // 完整发送结束。
+    }
+}
+```
+
+如果还有剩余数据，可以让新的 operation 自己拥有剩余字节；也可以按 19.1 节重置当前 operation，再调用 `refreshBuffer()` 指向剩余范围。两种方式都必须等前一次 send 最终完成后才能执行。
+
+### 19.1 可选：复用 event 和 `OVERLAPPED`
+
+理解部分发送只需要掌握 `offset` 和剩余范围。只有选择复用同一个 `SendOperation` 时，才需要下面的重置步骤。
+
+`WSACreateEvent()` 创建的是 manual-reset event，也就是需要显式恢复状态的事件。一次 operation 完成后，event 处于 signaled 状态；复用同一个 event 前，要调用：
+
+```cpp
+BOOL WSAResetEvent(WSAEVENT hEvent);
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `hEvent` | 要恢复为 nonsignaled 状态的 `WSAEVENT`。示例传入 `operation.event`。 |
+
+返回值：
+
+- `TRUE`：重置成功，可以继续准备下一次 operation。
+- `FALSE`：重置失败，立即调用 `WSAGetLastError()`，不要再次提交。
+
+完整准备顺序：
+
+```cpp
+BOOL const reset{WSAResetEvent(operation.event)};
+if (reset == FALSE)
+{
+    int const error{WSAGetLastError()};
+    reportWinsockError(error);
+}
+else
+{
+    operation.overlapped = {};
+    operation.overlapped.hEvent = operation.event;
+    operation.refreshBuffer();
+    // 此时才可以提交剩余数据。
+}
+```
+
+`operation.overlapped = {};` 用于清除前一次 operation 留下的内部状态，随后必须重新设置 `hEvent`。这些操作只能发生在前一次 send 最终完成之后。
+
+规则：
+
+1. `transferredBytes` 是本次完成量，不是累计量。
+2. 完成字节数为 `0` 时不能无限重试，应视为无进展错误。
+3. 前一次 send 最终完成后，才可以更新 `offset` 和 `WSABUF`。
+4. `refreshBuffer()` 只更新剩余范围；复用原 operation 再次提交前，还要执行 19.1 节的重置步骤。
+
+---
+
+## 20. 项目 `IoOperation` 所有权分析
+
+分析范围：
 
 ```text
 server_transport/internal/RemoteControlTransportImpl.h
+  → IoOperation 声明
+
 server_transport/src/RemoteControlTransportRuntime.cpp
-server_transport/src/RemoteControlTransport.cpp
+  → IoOperation 构造函数
+  → refreshSendBuffer()
 ```
 
-### 13.1 项目结构
+`postReceive()`、completion worker、pending 计数和 `stop()` 涉及 completion port 与安全停机，不影响本节的所有权分析。
+
+### 20.1 结构成员
 
 ```cpp
 struct IoOperation final : OVERLAPPED
@@ -912,22 +1248,31 @@ struct IoOperation final : OVERLAPPED
 };
 ```
 
-成员职责：
+成员关系：
 
-| 成员 | 作用 | 所有权 |
-| --- | --- | --- |
-| `OVERLAPPED` 基类 | 原生操作状态 | `IoOperation` 自身 |
-| `type` | completion 分发类型 | 值成员 |
-| `connection` | 保证连接上下文存活 | 共享所有权 |
-| `acceptSocket` | `AcceptEx` 预创建 socket | accept operation 暂时持有 |
-| `storage` | receive/accept buffer | operation 拥有 |
-| `sendBytes` | 完整发送数据 | operation 拥有 |
-| `sendOffset` | 部分发送进度 | 值成员 |
-| `nativeBuffer` | 指向 storage 或 sendBytes | 非 owning 视图 |
+| 成员 | 作用 |
+| --- | --- |
+| `OVERLAPPED` 基类 | 让该对象本身表示一次原生异步 operation。 |
+| `type` | 标记 operation 是 accept、receive 还是 send；completion 分发在阶段四学习。 |
+| `connection` | 保存一个 `shared_ptr<ConnectionContext>` 强引用，使连接上下文至少存活到 operation 被回收。 |
+| `acceptSocket` | accept operation 使用的 socket；具体用法在阶段五学习。receive 和 send 不使用它。 |
+| `storage` | 拥有 receive 使用的 buffer；accept operation 也会复用该成员，具体用法在阶段五学习。 |
+| `sendBytes` | 拥有发送数据。 |
+| `sendOffset` | 记录部分发送进度。 |
+| `nativeBuffer` | 指向 `storage` 或 `sendBytes`，本身不拥有字节。 |
 
-### 13.2 receive operation 构造
+所有权链：
 
-项目关键代码：
+```text
+在途 operation 的所有者
+  → 保证 IoOperation 活到最终完成
+  → IoOperation 内部拥有 OVERLAPPED 基类和 storage/sendBytes
+  → IoOperation.connection 通过 shared_ptr 保持 ConnectionContext 存活
+```
+
+事件练习中，“在途 operation 的所有者”就是尚未返回的 `receiveOneChunk()` 调用。项目中的所有权转移与回收将在阶段四和阶段九展开。
+
+### 20.2 receive 构造函数
 
 ```cpp
 IoOperation::IoOperation(IoOperationType _type,
@@ -943,491 +1288,403 @@ IoOperation::IoOperation(IoOperationType _type,
 }
 ```
 
-构造函数参数：
-
-| 参数 | 作用 | 约束 |
-| --- | --- | --- |
-| `_type` | 指定操作类型，例如 `Receive` 或 `Accept`，completion 时据此分发。 | 必须与后续调用的原生 API 相匹配。 |
-| `_connection` | 与该 operation 关联的连接上下文。移动到成员后，保证 connection 活到最终 completion。 | accept 尚未建立连接时可以为空；receive 必须提供对应连接。 |
-| `_bufferSize` | 为 `storage` 分配的字节数。 | 必须大于零，并且能够安全转换为 `ULONG` 供 `WSABUF::len` 使用。 |
-
-这是构造函数，没有返回值。构造完成后，`nativeBuffer` 已指向 `storage`，但 operation 尚未提交。
-
-所有权图：
-
-```text
-IoOperation
-  ├─ owns OVERLAPPED
-  ├─ owns QByteArray storage
-  ├─ WSABUF nativeBuffer ─→ storage.data()
-  └─ owns shared_ptr<ConnectionContext>
-                         └─ keeps connection alive
-```
-
-### 13.3 为什么 operation 持有 connection
-
-关闭可能发生在 receive 仍在途时：
-
-```text
-ConnectionRegistry 移除 connection
-  → socket 关闭或取消
-  → receive 的最终 completion 尚未返回
-```
-
-如果 operation 不持有 connection，注册表移除后 connection 可能析构，而 completion handler 仍需要读取连接状态。
-
-`shared_ptr` 只保证连接对象存活，不保证 socket 仍然可用。是否允许新 I/O 仍由状态机、`socketMutex` 和 socket 值共同判断。
-
----
-
-## 14. `postReceive()` 的所有权移交
-
-项目函数契约可以概括为：
-
-```cpp
-bool postReceive(
-    std::shared_ptr<ConnectionContext> const& _connection);
-```
-
-| 参数 | 作用 | 生命周期要求 |
-| --- | --- | --- |
-| `_connection` | 指定要投递下一次 receive 的连接。函数会把它复制到新建的 `IoOperation::connection`。 | 调用时必须指向有效连接；复制出的 `shared_ptr` 会让连接活到 completion。 |
-
-返回值：
-
-- `true`：receive 已成功进入完成协议，包括立即成功和 `WSA_IO_PENDING`。
-- `false`：服务正在停止、连接已终止、pending 无法注册或同步投递失败。
-
-主要副作用：创建 receive operation、增加 pending、调用 `WSARecv()`；同步投递失败时还会回滚 pending 并触发连接关闭。
-
-项目流程：
-
-```text
-1. make_unique<IoOperation>
-2. local unique_ptr 拥有 operation
-3. 锁定 connection.socketMutex
-4. 检查 stopping、terminal、INVALID_SOCKET
-5. tryBeginOperation() 增加 pending
-6. unique_ptr.release() 得到 raw pointer
-7. 调用 WSARecv(raw pointer)
-8. 同步投递失败：reset(raw pointer) 收回并 finishOperation()
-9. 成功或 pending：等待 completion worker 重新接管
-```
-
-关键代码形态：
-
-```cpp
-auto operation{
-    std::make_unique<IoOperation>(IoOperationType::Receive,
-                                  connection,
-                                  ReceiveChunkSize)};
-
-if (!this->tryBeginOperation())
-{
-    return false;
-}
-
-IoOperation* const operationPointer{operation.release()};
-int const result{WSARecv(connection->socket,
-                         &operationPointer->nativeBuffer,
-                         1,
-                         &bytesReceived,
-                         &flags,
-                         operationPointer,
-                         nullptr)};
-
-if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
-{
-    operation.reset(operationPointer);
-    this->finishOperation();
-}
-```
-
-### 14.1 `release()` 的准确含义
-
-`release()` 不代表 Windows 获得 C++ 所有权。Windows 不会执行 `delete operationPointer`。
-
-它表示：
-
-```text
-local unique_ptr 暂时放弃自动析构
-  → 应用把回收责任交给“完成协议”
-  → completion worker 将 raw pointer 重新包装为 unique_ptr
-```
-
-### 14.2 同步投递失败为什么 `reset()`
-
-同步投递失败时不会进入正常 completion 回收路径，因此当前线程必须：
-
-1. 用 `reset(operationPointer)` 收回所有权。
-2. 回滚 pending。
-3. 进入连接错误处理。
-
-### 14.3 立即成功为什么不 `reset()`
-
-项目 socket 已关联 IOCP。默认情况下，立即成功仍会投递 completion packet：
-
-```text
-WSARecv 返回 0
-  → operation 已完成
-  → completion packet 仍将到达
-  → completion worker 统一回收
-```
-
-如果提交线程立即 `reset()`，completion worker 之后得到的将是悬空 `OVERLAPPED*`。
-
----
-
-## 15. completion 路径如何收回 operation
-
-项目入口 `runCompletionWorker()` 没有形参，返回类型为 `void`。它使用 `this->m_completionPort` 等成员持续取得完成通知，收到退出控制包或停机条件后返回。
-
-三个 completion handler 的核心参数含义一致：
+参数：
 
 | 参数 | 作用 |
 | --- | --- |
-| `_operation` | 通过 `std::unique_ptr<IoOperation>` 接管完成操作的唯一所有权。handler 返回时自动析构，或在部分发送等场景中再次移动并提交。 |
-| `_success` | 原生完成是否成功。失败和取消同样必须回收 `_operation`。 |
-| `_transferredBytes` | receive/send 的最终字节数。只在对应完成语义允许时使用；失败时不要当作有效业务长度。 |
+| `_type` | operation 类型。 |
+| `_connection` | 与 operation 关联的上下文；移动到 `connection` 后形成强引用，保证上下文不会早于 operation 消失。 |
+| `_bufferSize` | `storage` 的字节数。 |
 
-项目 completion worker 的关键动作：
+观察重点：
+
+```text
+IoOperation.storage
+  └─ 拥有 receive 使用的真实字节内存
+
+IoOperation.nativeBuffer.buf
+  └─ 指向 storage.data()，但不拥有这块内存
+
+IoOperation.connection
+  └─ 通过 shared_ptr 保持 ConnectionContext 存活
+```
+
+### 20.3 send buffer 更新
 
 ```cpp
-this->finishOperation();
-
-auto operation{
-    std::unique_ptr<IoOperation>{static_cast<IoOperation*>(overlapped)}};
+void IoOperation::refreshSendBuffer()
+{
+    this->nativeBuffer.buf = this->sendBytes.data() + this->sendOffset;
+    this->nativeBuffer.len = static_cast<ULONG>(
+        this->sendBytes.size() - this->sendOffset);
+}
 ```
 
-随后通过 `operation->type` 分发到 accept、receive 或 send handler。
-
-所有权时间线：
-
-```text
-提交前：local unique_ptr
-提交后：完成协议持有 raw pointer 的回收责任
-completion：worker unique_ptr 重新接管
-handler 结束：unique_ptr 自动析构
-```
-
-receive handler 只使用有效范围：
-
-```cpp
-connection->receiveBuffer.append(
-    operation->storage.constData(),
-    static_cast<int>(transferredBytes));
-```
-
-完成解析后再投递下一次 receive，从而保持每连接最多一个 receive 在途。
+该函数没有参数，使用成员 `sendBytes` 和 `sendOffset` 计算剩余发送范围。
 
 ---
 
-## 16. pending 计数为什么先增加
+## 21. 常见错误
 
-两个计数函数的契约：
-
-| 函数 | 参数 | 返回值 | 副作用 |
-| --- | --- | --- | --- |
-| `tryBeginOperation()` | 无 | 服务未停止且成功登记操作时返回 `true`；正在停止时返回 `false`。 | 成功时将 pending 增加一次。 |
-| `finishOperation()` | 无 | `void`。 | 将 pending 减少一次；减到零时通知等待停机的条件变量。 |
-
-调用约束：每次成功的 `tryBeginOperation()` 必须与恰好一次 `finishOperation()` 配对。
-
-项目顺序：
-
-```text
-tryBeginOperation() 增加 pending
-  → WSARecv/WSASend
-      ├─ 同步投递失败：当前线程 finishOperation()
-      └─ 成功提交：completion worker finishOperation()
-```
-
-如果改为 API 返回后再增加，会产生立即完成竞态：
-
-```text
-Thread A: WSARecv 立即完成
-Thread B: 先取得 completion，pending--
-Thread A: 才执行 pending++
-```
-
-后果可能包括：
-
-- pending 下溢。
-- pending 被错误观察为零。
-- 停机线程提前关闭 completion port。
-- operation 尚未回收，worker 却开始退出。
-
-正确不变量：
-
-> 每次成功进入完成协议的操作恰好增加一次 pending，并由同步失败回滚或最终 completion 恰好减少一次。
-
----
-
-## 17. `socketMutex` 解决什么竞态
-
-错误时序：
-
-```text
-Thread A: 检查 connection.socket 有效
-Thread B: closesocket(connection.socket)
-Thread A: 对已经关闭、甚至已被系统复用的值调用 WSARecv
-```
-
-项目让提交与关闭共享 `socketMutex`：
-
-```text
-提交路径：lock → 检查 → 增加 pending → WSARecv → unlock
-关闭路径：lock → 禁止新提交 → 取消/关闭 socket → unlock
-```
-
-检查和提交必须在同一个同步边界内，不能只在调用 API 前读取一次 socket 值。
-
----
-
-## 18. 常见错误与症状
-
-| 错误 | 典型症状 | 根因 |
+| 错误 | 症状 | 根因 |
 | --- | --- | --- |
-| 提交后释放 operation | 随机崩溃、堆损坏 | Windows 仍引用 `OVERLAPPED*` |
-| buffer 在途时扩容 | 数据写入旧地址 | `WSABUF.buf` 已失效 |
-| 复用在途 `OVERLAPPED` | 完成归属混乱 | 两个操作共享同一标识 |
-| 把 `WSA_IO_PENDING` 当失败 | 正常连接立即关闭 | 误解提交返回值 |
-| 取消后立即释放 | 停机或断线时崩溃 | 取消 completion 尚未返回 |
-| 使用整个 buffer 容量 | 协议尾部垃圾 | 忽略 `transferredBytes` |
-| send 引用临时字符串 | 客户端收到乱码 | 发送数据提前失效 |
-| 提交与关闭未同步 | 偶发 `WSAENOTSOCK` | socket 在检查后被关闭 |
-| API 后才增加 pending | 停机提前退出 | 立即完成竞态 |
+| 把 `WSA_IO_PENDING` 当失败 | 正常 operation 被中止 | 未区分提交成功与最终完成 |
+| 提交后函数立即返回 | 随机崩溃、内存破坏 | 局部 `OVERLAPPED` 和 buffer 失效 |
+| 在途期间扩容 buffer | 数据写入旧地址 | `WSABUF.buf` 已悬空 |
+| 同一 `OVERLAPPED` 同时投递两次 | 完成结果混乱 | operation 标识被复用 |
+| event signaled 就认为成功 | 错误未被发现 | 没有调用 `WSAGetOverlappedResult()` |
+| 使用整个 buffer 容量 | 协议出现尾部垃圾 | 忽略完成字节数 |
+| receive 零字节后继续投递 | 反复关闭或空循环 | 未识别对端正常关闭 |
+| send 数据来自临时字符串 | 客户端收到乱码 | send buffer 提前失效 |
+| 假设一次 send 完成全部数据 | 响应被截断 | 未处理部分发送 |
+| 复用 event 和 `OVERLAPPED` 前未重置 | 等待立即返回旧状态或完成信息混乱 | 沿用了上一次 operation 的状态 |
 
 ---
 
-## 19. 调试记录模板
+## 22. 阶段练习与验收
 
-每次跟踪一个 operation，记录：
+按编号完成练习，先根据验收标准自行检查，再查看“参考答案与解释”。API 参数题重在理解参数作用、控制流和生命周期，不要求死记函数原型。
 
-```text
-operation 类型：
-operation 地址：
-OVERLAPPED 地址：
-buffer 地址：
-connection id：
-socket 值：
+### 22.1 任务一：画对象关系图
 
-提交线程 ID：
-提交前 pending：
-WSARecv/WSASend 返回值：
-同步错误码：
+**练习**
 
-完成线程 ID：
-完成 success：
-完成错误码：
-transferredBytes：
-完成后 pending：
-
-operation 析构位置：
-connection 是否仍存活：
-```
-
-至少推演以下四种情况：
-
-1. receive 立即完成。
-2. receive 返回 `WSA_IO_PENDING` 后成功完成。
-3. 对端正常关闭，成功完成且字节数为零。
-4. 请求取消后返回取消完成。
-
----
-
-## 20. 源码阅读顺序
-
-### 20.1 `IoOperation` 声明
-
-阅读：
+画出以下对象：
 
 ```text
-server_transport/internal/RemoteControlTransportImpl.h
-```
-
-回答：
-
-1. 哪些成员拥有内存？
-2. 哪些成员只是视图？
-3. accept、receive 和 send 各使用哪些成员？
-4. connection 为什么使用 `shared_ptr`？
-
-### 20.2 `IoOperation` 构造
-
-阅读：
-
-```text
-server_transport/src/RemoteControlTransportRuntime.cpp
-```
-
-回答：
-
-1. 为什么显式初始化 `OVERLAPPED{}`？
-2. `nativeBuffer.buf` 指向谁？
-3. 为什么 `refreshSendBuffer()` 要使用 `sendOffset`？
-
-### 20.3 `postReceive()` 与 `postSend()`
-
-阅读：
-
-```text
-server_transport/src/RemoteControlTransport.cpp
-```
-
-回答：
-
-1. 为什么先增加 pending？
-2. 为什么 API 前执行 `release()`？
-3. 为什么同步失败执行 `reset()`？
-4. 为什么立即成功不执行 `reset()`？
-5. `socketMutex` 与关闭路径如何配合？
-
-### 20.4 completion worker
-
-本阶段只观察 operation 回收：
-
-```text
-取得 OVERLAPPED*
-  → finishOperation()
-  → 转回 IoOperation*
-  → unique_ptr 接管
-  → handler
-  → 析构或重新投递
-```
-
-IOCP 的调度语义留到阶段四。
-
----
-
-## 21. 练习题
-
-### 21.1 概念题
-
-1. `WSABUF` 为什么不能保证 buffer 存活？
-2. 为什么 API 返回不总等于操作结束？
-3. `WSA_IO_PENDING` 表示成功还是失败？
-4. 为什么一个在途操作必须独占一个 `OVERLAPPED`？
-5. `CancelIoEx()` 后为什么仍要取得最终结果？
-6. receive 成功且字节数为零表示什么？
-7. 项目中谁拥有 receive buffer？
-8. operation 为什么持有 connection 的 `shared_ptr`？
-9. pending 为什么在 API 前增加？
-10. 事件模式立即完成和 IOCP 模式立即完成的回收方式有什么差异？
-
-### 21.2 所有权图练习
-
-画出以下对象，并在边上标记 `owns`、`observes`、`keeps alive`：
-
-```text
-ConnectionRegistry
-ConnectionContext
-IoOperation
+SOCKET
 OVERLAPPED
-QByteArray storage
-WSABUF nativeBuffer
-completion worker
+WSAEVENT
+WSABUF
+storage
 ```
 
-### 21.3 时序练习
+把 `OVERLAPPED` 标注为当前 operation 的原生标识，并使用“拥有”“指向”“保存句柄”“操作目标”说明对象关系。然后解释：为什么同一个 `OVERLAPPED` 不能同时代表两个在途 operation？
 
-分别画出：
+**验收标准**
 
-1. `WSARecv()` 同步投递失败。
-2. `WSARecv()` 返回 `WSA_IO_PENDING` 后成功完成。
-3. `WSARecv()` 立即成功并通过 IOCP 回收。
-4. 连接关闭导致 receive 被取消。
+- [ ] 图中包含全部五个对象。
+- [ ] 能指出真实字节由谁拥有。
+- [ ] 能指出 `WSABUF` 为什么不是所有者。
+- [ ] 能指出 event 由哪个字段引用。
+- [ ] 能指出 operation 与 socket 是目标关系，不是所有权关系。
+- [ ] 能解释一个在途 operation 必须独占一个 `OVERLAPPED`。
 
-每张图都要标出：
-
-- pending 增减位置。
-- operation 所有者。
-- buffer 是否仍被 Windows 引用。
-- connection 由谁保活。
-
----
-
-## 22. 参考答案要点
-
-### 22.1 `WSABUF`
-
-它只有地址和长度，不知道内存来自哪个 C++ 对象，也不会复制、移动或释放数据，因此只能观察 buffer。
-
-### 22.2 `WSA_IO_PENDING`
-
-表示操作已经正常提交，但最终结果尚未产生。operation 和 buffer 必须继续存活。
-
-### 22.3 取消
-
-取消是操作的一种最终完成结果。`CancelIoEx()` 只提出请求，完成通知到达前系统仍可能引用操作内存。
-
-### 22.4 connection 保活
-
-连接可能先从 registry 移除，再收到取消 completion。operation 的 `shared_ptr` 让 completion handler 仍能安全访问连接上下文。
-
-### 22.5 pending 顺序
-
-先增加 pending 可以覆盖立即完成竞态。同步投递失败由提交线程回滚，成功提交由完成路径减少。
-
-### 22.6 立即完成差异
-
-- 纯事件模式：返回 `0` 表示操作已经完成，当前路径可处理结果。
-- 项目 IOCP 模式：默认仍会收到 completion packet，由 worker 统一回收 operation。
-
----
-
-## 23. 阶段验收
-
-### 23.1 必须能够解释
-
-- [ ] 同步 I/O 与 Overlapped I/O 的控制流差异。
-- [ ] `OVERLAPPED`、`WSABUF`、buffer 的职责和所有权。
-- [ ] 立即完成、`WSA_IO_PENDING`、同步投递失败。
-- [ ] 为什么取消后仍不能释放 operation。
-- [ ] 为什么只能使用 `[0, transferredBytes)`。
-- [ ] 为什么 send operation 必须拥有发送数据。
-- [ ] 为什么要处理部分发送。
-- [ ] 为什么项目 operation 持有 connection。
-- [ ] 为什么 pending 在 API 前增加。
-- [ ] 为什么提交和关闭共用 `socketMutex`。
-
-### 23.2 必须能够画出
-
-- [ ] 一次 receive operation 生命周期图。
-- [ ] `IoOperation` 的对象所有权图。
-- [ ] 同步投递失败的回滚路径。
-- [ ] pending receive 的完成路径。
-- [ ] 取消后的最终回收路径。
-
-### 23.3 闭卷复述
-
-不看资料完整讲出：
+**参考答案与解释**
 
 ```text
-创建 operation 和 buffer
-  → 增加 pending
-  → 提交 WSARecv
-  → 判断立即完成、pending 或同步失败
-  → 等待最终完成
-  → 使用 transferredBytes
-  → 减少 pending
-  → 释放 operation
+storage             ──拥有──> 真正的字节内存
+WSABUF.buf           ──指向──> storage.data()
+OVERLAPPED.hEvent    ──保存──> WSAEVENT 句柄
+WSARecv / WSASend    ──操作──> SOCKET
+OVERLAPPED           ──标识──> 当前这一次 I/O operation
 ```
 
-如果无法明确说明每一步由谁拥有 operation、buffer 和 connection，就继续学习阶段三，不要进入阶段四。
+逐行解释：
+
+1. `storage` 是真正存放数据的内存。例如 receive 完成后，收到的字节就在这里。
+2. `WSABUF.buf` 只保存 `storage` 的地址。它没有自己的数据，也不会负责释放 `storage`。
+3. `OVERLAPPED.hEvent` 保存事件句柄。operation 完成后，Windows 会把这个 event 设为 signaled。
+4. `WSARecv()` 或 `WSASend()` 在某个 `SOCKET` 上提交 operation，但不会取得 socket 的所有权。
+5. `OVERLAPPED` 是这一次 operation 的原生状态记录，Windows 会在其中维护内部状态和完成信息。
+
+可以把 `OVERLAPPED` 理解为一张 I/O 工单：一次 operation 使用一张工单，完成结果也写回这张工单。如果两个尚未完成的 operation 共用同一个 `OVERLAPPED`，就相当于两项任务共用同一张工单，两次操作会修改同一份状态，应用也无法判断结果属于哪一次操作。因此：
+
+> 一个在途 operation 必须独占一个 `OVERLAPPED`，直到该 operation 最终完成。
+
+### 22.2 任务二：读懂 API 参数
+
+**练习**
+
+根据前面的函数声明和调用示例，依次解释以下调用中的每个实参：
+
+- `WSASocketW()` 六个参数。
+- `WSARecv()` 七个参数。
+- `WSAWaitForMultipleEvents()` 五个参数。
+- `WSAGetOverlappedResult()` 五个参数。
+- `WSASend()` 七个参数。
+
+每个实参说明四项内容：当前示例值、输入或输出方向、实际作用、是否涉及 operation 生命周期。无需默写参数类型和完整函数原型。
+
+**验收标准**
+
+- [ ] 看着函数声明，能从左到右解释每个实参的当前值和用途。
+- [ ] 能解释 `nullptr`、`1`、`TRUE`、`FALSE` 和 `WSA_INFINITE` 在当前示例中的含义。
+- [ ] 能指出哪些参数指向的对象必须活到最终完成。
+- [ ] 能区分“提交返回值”和“最终完成字节数”，不从提交期输出参数读取最终结果。
+
+**参考答案与解释**
+
+| 参数或字段 | 当前用法 | 关键原因 |
+| --- | --- | --- |
+| `lpBuffers` | 描述 receive 或 send 的真实 buffer | `WSABUF` 描述符会被捕获，但它指向的真实内存必须活到最终完成。 |
+| `lpOverlapped` | 指向当前 operation 独占的 `OVERLAPPED` | Windows 使用它保存本次 operation 的内部状态和完成信息。 |
+| `lpOverlapped->hEvent` | 保存当前 operation 使用的 event | pending operation 完成后，Windows 将 event 设为 signaled。 |
+| `lpNumberOfBytesRecvd` / `lpNumberOfBytesSent` | 传 `nullptr` | 最终字节数统一由 `WSAGetOverlappedResult()` 取得。 |
+
+### 22.3 任务三：判断三种提交结果
+
+**练习**
+
+写出以下情况的含义和下一步：
+
+1. `WSARecv()` 返回 `0`。
+2. 返回 `SOCKET_ERROR`，错误为 `WSA_IO_PENDING`。
+3. 返回 `SOCKET_ERROR`，紧接着调用 `WSAGetLastError()` 得到 `WSAECONNRESET`。
+4. 把 `WSARecv()` 换成 `WSASend()` 后，三种提交结果的分类是否改变？
+
+**验收标准**
+
+- [ ] 不把 `WSA_IO_PENDING` 当作失败。
+- [ ] 知道返回 `0` 时不需要等待，但仍通过 `WSAGetOverlappedResult()` 取得最终字节数。
+- [ ] 知道 Overlapped I/O 的 `lpNumberOfBytesRecvd` 和 `lpNumberOfBytesSent` 按官方建议传 `nullptr`。
+- [ ] 知道同步投递失败没有进入在途状态。
+- [ ] 能把同一套三分法应用到 `WSASend()`。
+
+**参考答案与解释**
+
+```text
+返回 0
+  → 立即完成
+  → 不等待
+  → WSAGetOverlappedResult 取得最终结果
+
+WSA_IO_PENDING
+  → 提交成功、尚未最终完成
+  → 等待 event
+  → WSAGetOverlappedResult 取得最终结果
+
+其他错误
+  → 同步投递失败
+  → 当前路径处理错误
+```
+
+`WSARecv()` 和 `WSASend()` 使用相同的提交结果三分法。
+
+### 22.4 任务四：写出一次 event-based receive
+
+**练习**
+
+完成两项内容：
+
+1. 画出一次 pending receive 的完整时序，并标出对象何时可以释放。
+2. 不构建项目，可以查看 API 函数声明，但不要照抄 `receiveOneChunk()`；独立写出 `WSARecv()`、`WSAWaitForMultipleEvents()` 和 `WSAGetOverlappedResult()` 的关键调用片段，并处理三种提交结果。
+
+可使用以下骨架组织控制流：
+
+```text
+WSARecv
+  ├─ 返回 0：？
+  ├─ WSA_IO_PENDING：？
+  └─ 其他错误：？
+```
+
+**验收标准**
+
+- [ ] `OVERLAPPED` 和 storage 都活到最终结果取得。
+- [ ] 能说明服务提供者会捕获 `WSABUF` 描述符，但其指向的真实字节必须继续存活。
+- [ ] 不把 event signaled 直接当作成功。
+- [ ] 能处理 `WSAGetOverlappedResult()` 返回 `FALSE` 的最终失败路径。
+- [ ] 只在最终完成后关闭 event。
+- [ ] 能解释局部变量为什么在 `receiveOneChunk()` 中是安全的。
+- [ ] 代码片段对 `lpNumberOfBytesRecvd` 传 `nullptr`，并统一从 `WSAGetOverlappedResult()` 取得字节数。
+
+**参考答案与解释**
+
+```text
+对象创建
+  → WSARecv
+  → 判断立即完成、pending 或同步失败
+  → pending 时等待 event
+  → 成功提交路径调用 WSAGetOverlappedResult
+  → 使用 [0, transferredBytes)
+  → 关闭 event
+  → 对象析构
+```
+
+event 只表示 operation 已结束；成功、错误和字节数仍由 `WSAGetOverlappedResult()` 给出。`WSABUF` 是描述符，`WSABUF.buf` 指向的 storage 才是必须持续存活的真实 buffer。
+
+如果 `WSAGetOverlappedResult()` 返回 `FALSE`，应立即保存 `WSAGetLastError()`，不得把 buffer 当作成功接收的数据处理。
+
+### 22.5 任务五：解释 receive 数据语义
+
+**练习**
+
+回答：
+
+1. 为什么本练习使用非零长度 TCP receive 时，成功且 `transferredBytes == 0` 表示对端正常关闭发送方向？
+2. 为什么不能处理整个 buffer 容量？
+3. 为什么一次 completion 不能直接当作一个 Packet？
+
+**验收标准**
+
+- [ ] 能识别非零长度 TCP receive 的零字节完成。
+- [ ] 只处理 `[0, transferredBytes)`。
+- [ ] 能说明半包和粘包仍然存在。
+
+**参考答案与解释**
+
+```text
+非零长度 TCP receive 成功且 transferredBytes == 0
+  → TCP 对端正常关闭发送方向
+
+有效数据范围
+  → [0, transferredBytes)
+
+一次 completion
+  → 只代表本次收到的一批 TCP 字节
+  → 不提供应用消息边界
+```
+
+### 22.6 任务六：推演部分发送
+
+**练习**
+
+总长度为 1500 bytes：
+
+- 第一次完成 600。
+- 第二次完成 500。
+- 第三次完成 400。
+
+写出每次完成后的 `offset` 和下一次 `WSABUF` 范围。
+
+然后回答：
+
+1. 为什么在途期间不能修改或释放完整 send buffer？
+2. 如果某次成功完成但 `transferredBytes == 0`，为什么不能继续无限重投？
+3. 何时才可以更新 `offset`、刷新 `WSABUF` 并投递剩余数据？
+
+**验收标准**
+
+- [ ] `offset` 使用累计完成量。
+- [ ] 每次 `WSABUF` 只指向剩余范围。
+- [ ] 能解释 send operation 为什么必须拥有发送数据。
+- [ ] 知道完成字节数为零时不能无限重投。
+- [ ] 只在前一次 send 最终完成后更新发送进度。
+
+**参考答案与解释**
+
+```text
+第一次：offset = 600，下一次 [600, 1500)
+第二次：offset = 1100，下一次 [1100, 1500)
+第三次：offset = 1500，发送完成
+
+transferredBytes == 0
+  → 没有取得进展
+  → 停止重投并进入错误处理
+```
+
+send 最终完成前，系统仍可能读取 send buffer；只有取得最终完成结果后，才能累计 `offset` 并准备下一次 operation。复用当前 event 和 `OVERLAPPED` 继续发送时，按 19.1 节完成重置。
+
+### 22.7 任务七：只读项目 `IoOperation`
+
+**练习**
+
+从 `IoOperation` 中找出并画成所有权链：
+
+1. receive buffer 所有者。
+2. send buffer 所有者。
+3. 不拥有数据的原生视图。
+4. 部分发送进度字段。
+5. 保持 `ConnectionContext` 存活的成员。
+
+**验收标准**
+
+- [ ] 能画出 `IoOperation` 内部所有权图。
+- [ ] 能解释 `nativeBuffer` 指向哪个拥有数据的成员。
+- [ ] 能解释 `connection` 为什么使用 `shared_ptr`，以及它保持谁存活。
+- [ ] 只阅读声明、构造函数和 `refreshSendBuffer()`。
+- [ ] 不依赖 completion worker、pending 计数和安全停机知识。
+
+**参考答案与解释**
+
+```text
+storage
+  └─ 拥有 receive 使用的真实字节内存
+
+sendBytes
+  └─ 拥有 send 使用的完整待发送数据
+
+nativeBuffer.buf
+  └─ 指向 storage 或 sendBytes 中的一段内存，本身不拥有数据
+
+sendOffset
+  └─ 记录 sendBytes 中已经完成发送的字节数
+
+connection
+  └─ 通过 shared_ptr 保持 ConnectionContext 存活
+```
+
+### 22.8 最终综合验收
+
+**练习**
+
+闭卷完成三项内容，不要求默写 API 原型：
+
+1. 对比同步 `recv()` 和 event-based Overlapped receive 的控制流与 buffer 生命周期。
+2. 使用以下关键词，自行组织并复述完整流程：`WSA_FLAG_OVERLAPPED`、event、`OVERLAPPED`、`WSABUF`、真实 buffer、返回 `0`、`WSA_IO_PENDING`、同步失败、等待、`WSAGetOverlappedResult()`、`transferredBytes`、释放。
+3. 回答：当前 `OVERLAPPED`、真实 buffer 和 `ConnectionContext` 在最终完成前分别由谁保证存活？
+
+**验收标准**
+
+- [ ] 能解释同步调用返回与 Overlapped operation 最终完成的区别。
+- [ ] 能在不看资料的情况下组织完整控制流，不要求背诵函数原型。
+- [ ] 每一步都能说明 operation 和 buffer 是否仍被系统使用。
+- [ ] 能说明项目中的 `IoOperation`、真实 buffer 和 `ConnectionContext` 分别由谁保持存活。
+- [ ] 能解释为什么一个在途 operation 必须独占一个 `OVERLAPPED`。
+- [ ] 能同时解释 receive 零字节和 send 部分完成。
+- [ ] 复述过程不依赖阶段四及之后的知识。
+
+全部任务通过后，阶段三才算完成。
+
+---
+
+## 23. 下一阶段衔接
+
+阶段四只更换“最终完成通知与回收 operation 的位置”，不会改变本阶段已经得到的 I/O 语义：
+
+```text
+阶段三：每次 operation 通过 event 取得完成结果
+阶段四：多个 handle 的 operation 统一从 completion port 取得结果
+```
+
+进入阶段四时，直接带入下面四个结论：
+
+| 阶段三已经解决的问题 | 直接带入阶段四的结论 | 对应复习位置 |
+| --- | --- | --- |
+| `WSARecv()`、`WSASend()` 怎样提交 | 返回 `0` 和 `WSA_IO_PENDING` 都是成功提交，其他错误是同步失败 | 第 9、17 节 |
+| operation 内部对象怎样存活 | `OVERLAPPED`、真实 buffer 和 connection 必须活到最终完成 | 第 14、15、18、20 节 |
+| receive completion 的数据怎样使用 | 只处理实际完成范围；非零长度 TCP receive 完成 0 bytes 表示对端正常关闭 | 第 13 节 |
+| send completion 怎样推进 | 使用 `sendOffset` 累计完成量，未发送完就更新 `WSABUF` 后重新提交 | 第 19 节 |
+
+阶段四将在这些结论之上回答一个新问题：提交函数返回后，operation 的所有权怎样交给 completion worker，并由 worker 在成功或失败 completion 中统一回收？
+
+阶段四将引入：
+
+- completion port。
+- completion worker。
+- completion key。
+- 普通 completion 与人工控制包。
+- worker 退出。
+
+这些概念建立在本阶段的 operation 生命周期之上。
+
+---
 
 ## 24. 官方资料
 
-阅读时只关注四项：返回值、错误码、内存生命周期、最终完成方式。
+阅读时只关注参数、返回值和内存必须存活多久：
 
 - [WSASocketW](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsasocketw)
 - [WSARecv](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsarecv)
 - [WSASend](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsasend)
-- [WSAGetOverlappedResult](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsagetoverlappedresult)
+- [Overlapped I/O and Event Objects](https://learn.microsoft.com/en-us/windows/win32/winsock/overlapped-i-o-and-event-objects-2)
 - [WSACreateEvent](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsacreateevent)
+- [WSAResetEvent](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsaresetevent)（仅用于 19.1 节的复用方案）
+- [WSACloseEvent](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsacloseevent)
 - [WSAWaitForMultipleEvents](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsawaitformultipleevents)
-- [CancelIoEx](https://learn.microsoft.com/en-us/windows/win32/fileio/cancelioex-func)
+- [WSAGetOverlappedResult](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsagetoverlappedresult)
 
-进入阶段四前，必须能准确回答：
+进入阶段四前，必须准确回答：
 
-> 当前这个 `OVERLAPPED`、`WSABUF`、buffer 和 connection，在最终完成结果到达前分别由谁保证存活？
+> `WSARecv()` 返回后，`OVERLAPPED`、真实 buffer 和关联的 `ConnectionContext` 分别由谁保证存活？应用通过什么步骤确认 operation 已最终完成并可以安全释放？
